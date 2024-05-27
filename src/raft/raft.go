@@ -29,7 +29,7 @@ import (
 )
 
 // Globals timeouts (ms)
-var electionTimeout int64 = 300
+var electionTimeout int64 = 500
 var heartbeatTimeout int64 = 50
 
 // as each Raft peer becomes aware that successive log entries are
@@ -63,12 +63,11 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu           sync.Mutex          // Lock to protect shared access to this peer's state
-	peers        []*labrpc.ClientEnd // RPC end points of all peers
-	persister    *Persister          // Object to hold this peer's persisted state
-	me           int                 // this peer's index into peers[]
-	dead         int32               // set by Kill()
-	term_updated chan bool
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     []*labrpc.ClientEnd // RPC end points of all peers
+	persister *Persister          // Object to hold this peer's persisted state
+	me        int                 // this peer's index into peers[]
+	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
 	currentState      RaftState
@@ -89,7 +88,6 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 
 	term = rf.currentTerm
-	// TODO mutex
 	isleader = (rf.currentState == Leader)
 
 	return term, isleader
@@ -174,23 +172,24 @@ type AppendEntriesReply struct {
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
+	Debug(dTimer, "S%d Follower, received requestVote for term %d", rf.me, args.Term)
+
 	// All servers
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.currentState = Follower
-		rf.votedFor = 0
-		select {
-		case rf.term_updated <- true:
-		default:
-			break
-		}
+		rf.votedFor = args.Id
+		reply.VoteGranted = true
+
+		return
 	}
 
 	//  Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
 		reply.VoteGranted = false
+
 		return
 	}
 
@@ -281,6 +280,9 @@ func (rf *Raft) killed() bool {
 // AppendEntries RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	// All servers
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
@@ -295,21 +297,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentState = Follower
 		rf.votedFor = 0
 		reply.Success = true
-		select {
-		case rf.term_updated <- true:
-		default:
-			break
-		}
-	}
+		rf.heartBeatReceived = true
 
-	//  Reply false if term < currentTerm (§5.1)
-	if rf.currentTerm > args.Term {
+		return
+	} else if rf.currentTerm > args.Term {
+		//  Reply false if term < currentTerm (§5.1)
 		reply.Success = false
 		return
 	} else {
 		Debug(dTimer, "S%d Follower, Heartbeat received on term %d", rf.me, args.Term)
-		rf.heartBeatReceived = true
+		// If term is equal, then we still recognize this leader...
 		rf.currentState = Follower
+		rf.heartBeatReceived = true
 	}
 
 }
@@ -320,7 +319,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // Starts the leader logic for elected raft
-// Sends heartbeat every 50ms to all servers
+// Sends heartbeat every to all servers
 func (rf *Raft) leaderHeatbeat() {
 	Debug(dTimer, "S%d Leader, Heartbeat started", rf.me)
 	for !rf.killed() {
@@ -332,8 +331,8 @@ func (rf *Raft) leaderHeatbeat() {
 		}
 
 		ret := make(chan bool, len(rf.peers)-1)
+
 		args := AppendEntriesArgs{rf.currentTerm, rf.Id}
-		reply := AppendEntriesReply{0, false}
 		for i := range rf.peers {
 			// Skip self
 			if i == rf.me {
@@ -341,14 +340,10 @@ func (rf *Raft) leaderHeatbeat() {
 			}
 			// Launch the AppendEntries RPCs in parallel
 			go func(peerIndex int) {
+				reply := AppendEntriesReply{}
 				rf.sendAppendEntries(peerIndex, &args, &reply)
 				ret <- reply.Success
 			}(i) // Pass 'i' as an argument to the function
-		}
-
-		// Wait on all replies
-		for i := 0; i < len(rf.peers)-1; i++ {
-			<-ret
 		}
 
 		// Heartbeat timeout - sleep for specified time.
@@ -356,29 +351,35 @@ func (rf *Raft) leaderHeatbeat() {
 	}
 }
 
-// Ticks on the election timeout for all rafts
-// 1  waits the timeout
-// 2 starts election if heartbeat not received
+// election timeout for all rafts
 func (rf *Raft) electionTicker() {
 
 	for !rf.killed() {
 
-		//ElectionLoop:
 		var startElection = false
 		var majorityVote = false
 
 		// Election Timeout - pause for a random amount of time.
 		// This one is collecting votes
-		ms := electionTimeout + (rand.Int63() % 200)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		var wg sync.WaitGroup
+		wg.Add(1) // Add count for one election timer
+		var election_timeout = make(chan bool, 1)
+		go func() {
+			defer wg.Done() // Notify WaitGroup that goroutine is finished
+			ms := electionTimeout + (rand.Int63() % 250)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			election_timeout <- true
+		}()
 
 		// Continue for leader, leader breaks only when receiving a
 		// RPC with higher term
 		_, isLeader := rf.GetState()
 		if isLeader {
+			wg.Wait() // Wait for election timer
 			continue
 		}
 
+		rf.mu.Lock()
 		// Election timeout went off, let's reset state to allow
 		// this raft to vote in other elections.
 		if rf.heartBeatReceived {
@@ -388,10 +389,12 @@ func (rf *Raft) electionTicker() {
 			// Convert to candidate
 			startElection = true
 		}
+		rf.mu.Unlock()
 
-		// Candidates
+		// Candidate
 		// If a heartBeat has NOT been received, hold an election.
 		if startElection {
+			rf.mu.Lock()
 			rf.currentState = Candidate // Set to Candidate state
 			rf.Id = rand.Int63()        // Grab new ID
 			rf.votedFor = rf.Id         // Vote for self
@@ -402,7 +405,6 @@ func (rf *Raft) electionTicker() {
 
 			// TODO set term information for filtering election candidates
 			args := RequestVoteArgs{rf.currentTerm, rf.Id, 0, 0}
-			reply := RequestVoteReply{0, false}
 
 			// Send requestVote RPC to all known rafts in parallel
 			vote_results := make(chan bool, len(rf.peers)-1)
@@ -413,30 +415,42 @@ func (rf *Raft) electionTicker() {
 				}
 				// Launch the requestVote RPCs in parallel
 				go func(peerIndex int) {
+					reply := RequestVoteReply{}
 					rf.sendRequestVote(peerIndex, &args, &reply)
 					vote_results <- reply.VoteGranted
 				}(i)
 			}
+			rf.mu.Unlock()
 
-			// Count the votes
+			// Wait for votes
+		loop:
 			for i := 0; i < len(rf.peers)-1; i++ {
-				if <-vote_results {
+				// TODO - The only way around the fact that this RPC can take
+				// longer to return than the timeout is if this RPC wait is moved
+				// to another thead, that is selected by either this RPC returning
+				// OR the timeout breaking
+				select {
+				case <-vote_results:
 					votes++
-				}
 
-				// Go ahead and break out if have a quorom
+				case <-election_timeout:
+					break loop
+
+				}
+				// Go ahead and break out if we have a quorom
 				if votes > (len(rf.peers) / 2) {
 					break
 				}
-
-				// case <-rf.term_updated:
-				//	goto ElectionLoop
+				// While waiting, if we became a follower break out.
+				if rf.currentState != Candidate {
+					break
+				}
 			}
 
-			//close(vote_results)
-			Debug(dInfo, "S%d Candidate, votes is %d", rf.me, votes)
+			rf.mu.Lock()
+			Debug(dInfo, "S%d Candidate, received %d votes.", rf.me, votes)
 
-			if votes > (len(rf.peers) / 2) {
+			if votes > (len(rf.peers)/2) && rf.currentState == Candidate {
 				majorityVote = true
 			}
 
@@ -456,10 +470,11 @@ func (rf *Raft) electionTicker() {
 				// Lost the election
 				Debug(dVote, "S%d Candidate, lost the vote!", rf.me)
 			}
-
+			rf.mu.Unlock()
 		}
+		wg.Wait() // Wait for election timer
 
-	}
+	} // end for
 
 }
 
@@ -482,7 +497,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.Id = 0
 	rf.currentState = Follower
 	rf.votedFor = 0
-	rf.term_updated = make(chan bool)
 
 	// Your initialization code here (3A, 3B, 3C).
 
