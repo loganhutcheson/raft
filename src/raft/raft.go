@@ -172,12 +172,16 @@ type AppendEntriesReply struct {
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	Debug(dTimer, "S%d Follower, received requestVote for term %d", rf.me, args.Term)
 
 	// All servers
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	if rf.currentTerm < args.Term {
+		Debug(dVote, "S%d Follower, granting vote to %d larger term %d.", rf.me, args.Id, args.Term)
 		rf.currentTerm = args.Term
 		rf.currentState = Follower
 		rf.votedFor = args.Id
@@ -188,6 +192,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//  Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
+		Debug(dVote, "S%d Follower, failed vote to %d smaller term %d.", rf.me, args.Id, args.Term)
 		reply.VoteGranted = false
 
 		return
@@ -196,9 +201,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
 	if rf.votedFor == 0 || rf.votedFor == args.Id {
+		Debug(dVote, "S%d Follower, granting vote to %d same term %d.", rf.me, args.Id, args.Term)
 		reply.VoteGranted = true
 		rf.votedFor = args.Id
 	} else {
+		Debug(dVote, "S%d Follower, failed vote to %d same term %d.", rf.me, args.Id, args.Term)
 		reply.VoteGranted = false
 	}
 
@@ -371,7 +378,7 @@ func (rf *Raft) electionTicker() {
 			election_timeout <- true
 		}()
 
-		// Continue for leader, leader breaks only when receiving a
+		// Continue for leader,  leader breaks only when receiving a
 		// RPC with higher term
 		_, isLeader := rf.GetState()
 		if isLeader {
@@ -389,12 +396,10 @@ func (rf *Raft) electionTicker() {
 			// Convert to candidate
 			startElection = true
 		}
-		rf.mu.Unlock()
 
 		// Candidate
 		// If a heartBeat has NOT been received, hold an election.
 		if startElection {
-			rf.mu.Lock()
 			rf.currentState = Candidate // Set to Candidate state
 			rf.Id = rand.Int63()        // Grab new ID
 			rf.votedFor = rf.Id         // Vote for self
@@ -425,18 +430,24 @@ func (rf *Raft) electionTicker() {
 			// Wait for votes
 		loop:
 			for i := 0; i < len(rf.peers)-1; i++ {
-				// TODO - The only way around the fact that this RPC can take
+				// The only way around the fact that this RPC can take
 				// longer to return than the timeout is if this RPC wait is moved
 				// to another thead, that is selected by either this RPC returning
 				// OR the timeout breaking
 				select {
-				case <-vote_results:
-					votes++
+
+				case vote := <-vote_results:
+					if vote {
+						Debug(dInfo, "S%d Candidate, got a vote.", rf.me)
+						votes++
+					}
 
 				case <-election_timeout:
+					Debug(dInfo, "S%d Candidate, timeout.", rf.me)
 					break loop
 
 				}
+
 				// Go ahead and break out if we have a quorom
 				if votes > (len(rf.peers) / 2) {
 					break
@@ -471,7 +482,10 @@ func (rf *Raft) electionTicker() {
 				Debug(dVote, "S%d Candidate, lost the vote!", rf.me)
 			}
 			rf.mu.Unlock()
+		} else {
+			rf.mu.Unlock()
 		}
+
 		wg.Wait() // Wait for election timer
 
 	} // end for
