@@ -72,9 +72,10 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	currentState      RaftState
 	heartBeatReceived bool
-	currentTerm       int
-	Id                int64
-	votedFor          int64
+
+	currentTerm int
+	votedFor    int64
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -145,7 +146,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term         int
-	Id           int64
+	CandidateId  int64
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -181,10 +182,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower (§5.1)
 	if rf.currentTerm < args.Term {
-		Debug(dVote, "S%d Follower, granting vote to %d larger term %d.", rf.me, args.Id, args.Term)
+		Debug(dVote, "S%d Follower, granting vote to %d larger term %d.",
+			rf.me, args.CandidateId, args.Term)
 		rf.currentTerm = args.Term
 		rf.currentState = Follower
-		rf.votedFor = args.Id
+		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 
 		return
@@ -192,7 +194,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	//  Reply false if term < currentTerm (§5.1)
 	if rf.currentTerm > args.Term {
-		Debug(dVote, "S%d Follower, failed vote to %d smaller term %d.", rf.me, args.Id, args.Term)
+		Debug(dVote, "S%d Follower, failed vote to %d smaller term %d.", rf.me,
+			args.CandidateId, args.Term)
 		reply.VoteGranted = false
 
 		return
@@ -200,12 +203,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// If votedFor is null or candidateId, and candidate’s log is at
 	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if rf.votedFor == 0 || rf.votedFor == args.Id {
-		Debug(dVote, "S%d Follower, granting vote to %d same term %d.", rf.me, args.Id, args.Term)
+	if rf.votedFor == 0 || rf.votedFor == args.CandidateId {
+		Debug(dVote, "S%d Follower, granting vote to %d same term %d.", rf.me,
+			args.CandidateId, args.Term)
 		reply.VoteGranted = true
-		rf.votedFor = args.Id
+		rf.votedFor = args.CandidateId
 	} else {
-		Debug(dVote, "S%d Follower, failed vote to %d same term %d.", rf.me, args.Id, args.Term)
+		Debug(dVote, "S%d Follower, failed vote to %d same term %d.", rf.me,
+			args.CandidateId, args.Term)
 		reply.VoteGranted = false
 	}
 
@@ -329,6 +334,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // Sends heartbeat every to all servers
 func (rf *Raft) leaderHeatbeat() {
 	Debug(dTimer, "S%d Leader, Heartbeat started", rf.me)
+	// Leader Id
+	leaderId := rand.Int63()
 	for !rf.killed() {
 		_, isLeader := rf.GetState()
 		if !isLeader {
@@ -339,7 +346,7 @@ func (rf *Raft) leaderHeatbeat() {
 
 		ret := make(chan bool, len(rf.peers)-1)
 
-		args := AppendEntriesArgs{rf.currentTerm, rf.Id}
+		args := AppendEntriesArgs{rf.currentTerm, leaderId}
 		for i := range rf.peers {
 			// Skip self
 			if i == rf.me {
@@ -401,15 +408,15 @@ func (rf *Raft) electionTicker() {
 		// If a heartBeat has NOT been received, hold an election.
 		if startElection {
 			rf.currentState = Candidate // Set to Candidate state
-			rf.Id = rand.Int63()        // Grab new ID
-			rf.votedFor = rf.Id         // Vote for self
+			candidateId := rand.Int63() // Grab new ID
+			rf.votedFor = candidateId   // Vote for self
 			votes := 1                  // Vote for self
 			rf.currentTerm++            // Increment the term
 			Debug(dVote, "S%d Follower, starting election id=%d, term=%d",
-				rf.me, rf.Id, rf.currentTerm)
+				rf.me, candidateId, rf.currentTerm)
 
 			// TODO set term information for filtering election candidates
-			args := RequestVoteArgs{rf.currentTerm, rf.Id, 0, 0}
+			args := RequestVoteArgs{rf.currentTerm, candidateId, 0, 0}
 
 			// Send requestVote RPC to all known rafts in parallel
 			vote_results := make(chan bool, len(rf.peers)-1)
@@ -508,7 +515,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.currentTerm = 0
-	rf.Id = 0
 	rf.currentState = Follower
 	rf.votedFor = 0
 
