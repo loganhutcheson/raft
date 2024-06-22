@@ -61,6 +61,12 @@ const (
 	Leader
 )
 
+// Define a struct to hold the integer and interface{}
+type IntAndInterface struct {
+	IntValue int
+	AnyValue interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -70,11 +76,21 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (3A, 3B, 3C).
-	currentState      RaftState
-	heartBeatReceived bool
+	applyCh chan ApplyMsg
 
+	// Persistent state
 	currentTerm int
 	votedFor    int64
+	log         map[int]IntAndInterface
+
+	// Volatile state
+	currentState      RaftState
+	heartBeatReceived bool
+	leaderId          int64
+	commitIndex       int
+	lastApplied       int
+	nextIndex         map[int]int
+	matchindex        map[int]int
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -154,7 +170,6 @@ type RequestVoteArgs struct {
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (3A).
 	Term        int
 	VoteGranted bool
 }
@@ -162,7 +177,11 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int64
-	// TODO add other term related entries
+
+	// 3B
+	PrevLogIndex int
+	Entries      map[int]IntAndInterface
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -176,44 +195,39 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Debug(dTimer, "S%d Follower, received requestVote for term %d", rf.me, args.Term)
+	// Debug(dTimer, "S%d Follower, received requestVote for term %d", rf.me, args.Term)
 
-	// All servers
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
-	if rf.currentTerm < args.Term {
-		Debug(dVote, "S%d Follower, granting vote to %d larger term %d.",
+	candidateTerm := args.Term
+	followerTerm := rf.currentTerm
+
+	// Case 1: candidate has a lower term
+	if candidateTerm < followerTerm {
+		// Reject candidate
+		Debug(dVote, "S%d Follower, reject vote for %d due to smaller term %d.",
 			rf.me, args.CandidateId, args.Term)
-		rf.currentTerm = args.Term
+		reply.VoteGranted = false
+		return
+	}
+
+	// Case 2: candidate has a greater or equal term
+	// Grant vote iff votedFor is null or candidateID
+	// and log is at least as up-to-date as candidate
+
+	// TODO 5.4.1 Election restriction:
+	// vote yes only if higher term in last entry, OR
+	// same last term && logs are each greater than or equal to eachother
+	if candidateTerm > followerTerm || rf.votedFor == 0 || rf.votedFor == args.CandidateId {
+		Debug(dVote, "S%d Follower, granting vote to %d same/greater term %d.", rf.me,
+			args.CandidateId, args.Term)
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
 		rf.currentState = Follower
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-
-		return
-	}
-
-	//  Reply false if term < currentTerm (§5.1)
-	if rf.currentTerm > args.Term {
-		Debug(dVote, "S%d Follower, failed vote to %d smaller term %d.", rf.me,
-			args.CandidateId, args.Term)
-		reply.VoteGranted = false
-
-		return
-	}
-
-	// If votedFor is null or candidateId, and candidate’s log is at
-	// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if rf.votedFor == 0 || rf.votedFor == args.CandidateId {
-		Debug(dVote, "S%d Follower, granting vote to %d same term %d.", rf.me,
-			args.CandidateId, args.Term)
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
 	} else {
-		Debug(dVote, "S%d Follower, failed vote to %d same term %d.", rf.me,
+		Debug(dVote, "S%d Follower, failed vote to %d same/greater term %d.", rf.me,
 			args.CandidateId, args.Term)
 		reply.VoteGranted = false
 	}
-
 }
 
 // send a RequestVote RPC to a server.
@@ -248,6 +262,63 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// A launched thread the endlessly tries to commit
+// a log to a specified raft index
+// also handles the back up procedure upon rejection
+func (rf *Raft) AppendAndSync(server int, cmd interface{}) bool {
+
+	term, _ := rf.GetState()
+
+	// Note it's already been committed by rf
+	newCommitIndex := rf.commitIndex
+	newEntries := make(map[int]IntAndInterface)
+	newEntries[newCommitIndex] = IntAndInterface{term, cmd}
+
+	prevLogIndex := rf.commitIndex - 1
+
+	args := AppendEntriesArgs{rf.currentTerm, rf.leaderId, prevLogIndex, newEntries, newCommitIndex}
+	reply := AppendEntriesReply{}
+
+	for !reply.Success {
+		Debug(dCommit, "S%d sends appendRPC to raft %d with entries len %d",
+			rf.me, server, len(newEntries))
+		// Block on send call as we are already threaded for each raft
+		rf.sendAppendEntries(server, &args, &reply)
+		// Maintain a nextIndex field (one for each follower)
+		// it's initialized to the currentIndex
+		// in response to errors, we decrement the nextIndex field
+		// and resend the append entry RPC to the failed server
+		// once we receive the success, then we back up to the full log
+
+		// TODO implement fast backup
+
+		if !reply.Success {
+			// Back up the nextIndex by 1 and ship it again.
+			if newCommitIndex > 0 {
+				rf.mu.Lock()
+				rf.nextIndex[server]--
+				rf.mu.Unlock()
+				newCommitIndex--
+				newEntries[newCommitIndex] = rf.log[newCommitIndex]
+				prevLogIndex--
+				args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, prevLogIndex, newEntries, newCommitIndex}
+			} else {
+				Debug(dCommit, "S%d ERROR sending to %d, 0th element rejected",
+					rf.me, server)
+				return false
+			}
+		}
+
+	}
+	// Successful commit by this raft
+	// Increment the matchIndex so we know we commited a new log.
+	rf.mu.Lock()
+	rf.matchindex[server]++
+	rf.mu.Unlock()
+
+	return true
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -266,7 +337,52 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	term, isLeader = rf.GetState()
 
+	// If this is not a leader return false
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	Debug(dLeader, "S%d Leader, Start() has been called!", rf.me)
+	// 1. Append the log to it's own (do not notify client success yet)
+	rf.mu.Lock()
+	rf.commitIndex++
+	rf.log[rf.commitIndex] = IntAndInterface{rf.currentTerm, command}
+	rf.mu.Unlock()
+
+	// 2. Issue RPCs to each rafts in parallel
+	commitResult := make(chan bool)
+
+	for i := range rf.peers {
+		// Skip self
+		if i == rf.me {
+			continue
+		}
+		// Launch a separate thread for each peer
+		go func(peerIndex int) {
+			result := rf.AppendAndSync(peerIndex, command)
+			commitResult <- result
+		}(i)
+	}
+
+	count := 0
+	for result := range commitResult {
+		Debug(dLeader, "S%d Leader, got a return commitment %t!",
+			rf.me, result)
+		count++
+		if count > (len(rf.peers) / 2) {
+			// Really commit this log as leader
+			msg := ApplyMsg{true, rf.log[rf.commitIndex].AnyValue, rf.commitIndex,
+				false, nil, 0, 0}
+			rf.applyCh <- msg
+			Debug(dLeader, "S%d Leader, Committed returning true!", rf.me)
+			break
+		}
+	}
+	// Set the index to notify the tester that we think this log is
+	// committed on the majority of servers.
+	index = rf.commitIndex
 	return index, term, isLeader
 }
 
@@ -295,34 +411,60 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// All servers
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
-	//While waiting for votes, a candidate may receive an
-	// AppendEntries RPC from another server claiming to be
-	// leader. If the leader’s term (included in its RPC) is at least
-	// as large as the candidate’s current term, then the candidate
-	// recognizes the leader as legitimate and returns to follower
-	// state
-	if rf.currentTerm < args.Term {
-		rf.currentTerm = args.Term
-		rf.currentState = Follower
-		rf.votedFor = 0
-		reply.Success = true
-		rf.heartBeatReceived = true
+	leaderTerm := args.Term
+	followerTerm := rf.currentTerm
 
+	// Case 1: Leader has a higher or equal term
+	// We accept this leader iff
+	// log is as long as prevCommitIndex and last index matches expected term
+	if leaderTerm >= followerTerm {
+		if args.Entries != nil {
+			// Log is at least as up to date, and the last entry is the same
+			if args.PrevLogIndex != len(rf.log) ||
+				(len(rf.log) > 0 && rf.log[args.PrevLogIndex].IntValue != args.Term) {
+				// Reject leader (and new entries)
+				Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
+					">= term case with entries. Error: Cannot accept entries.",
+					rf.me, args.Term)
+				Debug(dLog, "S%d error - len %d, prev %d",
+					rf.me, len(rf.log), args.PrevLogIndex)
+				reply.Success = false
+			} else {
+				// Accept leader (and new entries)
+				Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
+					">= term case with entries. Committing - log size %d",
+					rf.me, args.Term, len(rf.log))
+				rf.currentTerm = args.Term
+				rf.currentState = Follower
+				rf.votedFor = 0
+				reply.Success = true
+				rf.heartBeatReceived = true
+
+				// Commit new entry to log
+				rf.log[args.LeaderCommit] = args.Entries[args.LeaderCommit]
+
+				msg := ApplyMsg{true, rf.log[args.LeaderCommit].AnyValue, args.LeaderCommit,
+					false, nil, 0, 0}
+				rf.applyCh <- msg
+			}
+		} else {
+			// Accept leader (nil entries)
+			Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
+				">= term case with nill entries. Accept heartbeat.",
+				rf.me, args.Term)
+			rf.currentTerm = args.Term
+			rf.currentState = Follower
+			rf.votedFor = 0
+			reply.Success = true
+			rf.heartBeatReceived = true
+		}
 		return
-	} else if rf.currentTerm > args.Term {
-		//  Reply false if term < currentTerm (§5.1)
-		reply.Success = false
-		return
-	} else {
-		Debug(dTimer, "S%d Follower, Heartbeat received on term %d", rf.me, args.Term)
-		// If term is equal, then we still recognize this leader...
-		rf.currentState = Follower
-		rf.heartBeatReceived = true
 	}
 
+	// Case 2: Leader has lower term
+	// instant rejection.
+	Debug(dLog, "S%d Follower, received AppendRPC with lower term, rejecting...", rf.me)
+	reply.Success = false
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -335,7 +477,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) leaderHeatbeat() {
 	Debug(dTimer, "S%d Leader, Heartbeat started", rf.me)
 	// Leader Id
-	leaderId := rand.Int63()
+	rf.leaderId = rand.Int63()
 	for !rf.killed() {
 		_, isLeader := rf.GetState()
 		if !isLeader {
@@ -346,7 +488,11 @@ func (rf *Raft) leaderHeatbeat() {
 
 		ret := make(chan bool, len(rf.peers)-1)
 
-		args := AppendEntriesArgs{rf.currentTerm, leaderId}
+		// Send the heartbeat append RPC entries
+		// contains previous commit index (same as when initialized, or incremented with newly committed indexes
+		// contains nil entries
+		// contains leaders commit index, which is the same as the currentIndex as nothing is being committed.
+		args := AppendEntriesArgs{rf.currentTerm, rf.leaderId, rf.commitIndex, nil, rf.commitIndex}
 		for i := range rf.peers {
 			// Skip self
 			if i == rf.me {
@@ -514,11 +660,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.currentTerm = 0
-	rf.currentState = Follower
-	rf.votedFor = 0
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.applyCh = applyCh
+
+	// Persistent state
+	rf.currentTerm = 0
+	rf.votedFor = 0
+	rf.log = make(map[int]IntAndInterface)
+
+	// Volatile state
+	rf.currentState = Follower
+	rf.heartBeatReceived = false
+	rf.leaderId = 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make(map[int]int)
+	rf.matchindex = make(map[int]int)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
