@@ -30,7 +30,7 @@ import (
 
 // Globals timeouts (ms)
 var electionTimeout int64 = 500
-var heartbeatTimeout int64 = 50
+var HeartbeatTimeout int64 = 50
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -188,6 +188,12 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Fast Backup
+	XTerm  int // Term of the conflicting entry
+	XIndex int // Index of the first entry w/ XTerm
+	XLen   int // Length of the log
+
 }
 
 // RequestVote RPC handler.
@@ -284,33 +290,49 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // A launched thread the endlessly tries to commit
 // a log to a specified raft index
 // also handles the back up procedure upon rejection
-func (rf *Raft) AppendAndSync(server int, cmd interface{}) bool {
+func (rf *Raft) AppendAndSync(server int, cmd interface{}, logIndex int) bool {
 
 	term, _ := rf.GetState()
 
 	// Note - leader has NOT committed this yet until majority
-	newCommitIndex := rf.commitIndex + 1
-	prevLogIndex := rf.commitIndex
+	prevLogIndex := logIndex - 1
 	newEntries := make(map[int]IntAndInterface)
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 
 	// If we are supplied a cmd, we should first try to commit the
-	// new entry.
+	// new entry (entries between nextIndex and logIndex)
 	if cmd != nil {
-		newEntries[newCommitIndex] = IntAndInterface{term, cmd}
-		args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, rf.commitIndex,
-			rf.log[prevLogIndex].IntValue, newEntries, newCommitIndex}
-		Debug(dCommit, "S%d sends appendRPC to raft %d with entries len %d",
-			rf.me, server, len(newEntries))
+		rf.mu.Lock()
+
+		for index := rf.nextIndex[server]; index <= logIndex; index++ {
+			newEntries[index] = rf.log[index]
+		}
+
+		// If the nextIndex is past logIndex, let's abort
+		if rf.nextIndex[server] > logIndex {
+			Debug(dInfo, "S%d Leader aborting sendAndSync, not needed", rf.me)
+			return false
+		}
+
+		args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, rf.nextIndex[server] - 1,
+			rf.log[rf.nextIndex[server]-1].IntValue, newEntries, rf.commitIndex}
+		Debug(dInfo, "S%d Leader sends appendRPC to raft %d with entries len %d"+
+			"base index:%d term:%d cmd:%d",
+			rf.me, server, len(newEntries), logIndex, term, cmd)
+		rf.mu.Unlock()
+
 		// Block on send call as we are already threaded for each raft
 		rf.sendAppendEntries(server, &args, &reply)
+
 	} else {
-		// Otherwise, we assume this is a consistency check and flag failure.
+		// Otherwise, we assume this is a consistency check from heartbeat (nil)
 		reply.Success = false
 	}
 
 	for !reply.Success {
+
+		Debug(dError, "S%d Leader - AppendAndSync!!", rf.me)
 
 		// Check if we are still leader
 		_, isLeader := rf.GetState()
@@ -318,52 +340,88 @@ func (rf *Raft) AppendAndSync(server int, cmd interface{}) bool {
 			return false
 		}
 
+		// If the failure is because of follower on
+		// higher term, then we don't try to fix consistency
+		if reply.Term > rf.currentTerm {
+			return false
+		}
+
 		// Maintain a nextIndex field (one for each follower)
-		// it's initialized to the currentIndex
 		// in response to errors, we decrement the nextIndex field
 		// and resend the append entry RPC to the failed server
 		// once we receive the success, then we back up to the full log
+		Debug(dInfo, "S%d BACKUP server:%d reply.XTerm:%d, reply.XIndex:%d, reply.XLen:%d",
+			rf.me, server, reply.XTerm, reply.XIndex, reply.XLen)
+		if logIndex > 0 {
 
-		// TODO implement fast backup
-		// Consistency check failed for the latest log.
-
-		// Back up the nextIndex by 1 and ship it again.
-		if newCommitIndex > 0 {
+			// Fast Backup
 			rf.mu.Lock()
-			rf.nextIndex[server]--
-			rf.mu.Unlock()
-			newCommitIndex--
-			newEntries[newCommitIndex] = rf.log[newCommitIndex]
-			prevLogIndex--
-			// TODO - we should be appending the entries to the map
-			// to do a bulk-add once we find a match.
+			if reply.XTerm == -1 {
+				// Follower does not have an entry for this index
+				// backup to the last index of the follower's log
+				rf.nextIndex[server] = reply.XLen
+
+			} else {
+				// Check if leader has the follower's mismatched term
+				found := -1
+				for i, entry := range rf.log {
+					if entry.IntValue == reply.XTerm {
+						found = i + 1
+						break
+					}
+				}
+				if found >= 0 {
+					// Mismatched entries' term present in leader's log,
+					// backup to leader's first index of the found term
+					rf.nextIndex[server] = found
+					prevLogIndex = rf.nextIndex[server] - 1
+				} else {
+					// Not present in leader's log, backup to follower's
+					// first index of the missing term
+					rf.nextIndex[server] = reply.XIndex
+					prevLogIndex = rf.nextIndex[server] - 1
+				}
+			}
+
+			//prevLogIndex = rf.nextIndex[server] - 1
+
+			// Add all the missing entries between nextIndex and logIndex
+			for i := rf.nextIndex[server]; i < logIndex; i++ {
+				Debug(dInfo, "S%d BACKUP adding missing entries prevLogIndex %d, logindex %d "+
+					"index:%d term:%d", rf.me, prevLogIndex, logIndex, i, rf.log[i].IntValue)
+				newEntries[i] = rf.log[i]
+			}
+
+			// If the nextIndex is past logIndex, let's abort
+			if rf.nextIndex[server] > logIndex {
+				Debug(dInfo, "S%d Leader aborting sendAndSync, not needed", rf.me)
+				return false
+			}
+
 			args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, prevLogIndex,
-				rf.log[prevLogIndex].IntValue, newEntries, newCommitIndex}
-			Debug(dCommit, "S%d sends appendRPC to raft %d with entries len %d",
+				rf.log[prevLogIndex].IntValue, newEntries, rf.commitIndex}
+			Debug(dInfo, "S%d sends appendRPC to raft %d with entries len %d",
 				rf.me, server, len(newEntries))
+			rf.mu.Unlock()
+
 			// Block on send call as we are already threaded for each raft
 			rf.sendAppendEntries(server, &args, &reply)
-
-			if reply.Success {
-				// we also need to update the nextIndex
-				rf.nextIndex[server] = rf.commitIndex
-			}
 		} else {
 			Debug(dCommit, "S%d ERROR sending to %d, 0th element rejected",
 				rf.me, server)
 			return false
 		}
 
-		// TBD - sleep here to avoid a
-		// mess of RPCs flooding the network whenever
-		// some failure occurs
-		time.Sleep(100 * time.Millisecond)
+		// Sleep
+		// time.Sleep(100 * time.Millisecond)
 
 	}
 	// Successful commit by this raft
+	// Set nextIndex, so we know which is the next log to commit.
 	// Increment the matchIndex so we know we commited a new log.
 	rf.mu.Lock()
-	rf.matchindex[server]++
+	rf.nextIndex[server] = logIndex + 1
+	rf.matchindex[server] = logIndex
 	rf.mu.Unlock()
 
 	return true
@@ -385,8 +443,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
-	// Your code here (3B).
 	term, isLeader = rf.GetState()
 
 	// If this is not a leader return false
@@ -394,12 +450,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	Debug(dLeader, "S%d Leader, Start() has been called for cmd: %d!",
-		rf.me, command)
 	// 1. Append the log to it's own (do not notify client success yet)
 	rf.mu.Lock()
-	newCommitIndex := rf.commitIndex + 1
-	rf.log[newCommitIndex] = IntAndInterface{rf.currentTerm, command}
+	newLogIndex := len(rf.log) + 1
+	rf.log[newLogIndex] = IntAndInterface{rf.currentTerm, command}
+	Debug(dLeader, "S%d Leader, Start() has been called for cmd: %d!",
+		rf.me, command)
 	rf.mu.Unlock()
 
 	// 2. Issue RPCs to each rafts in parallel
@@ -412,7 +468,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		// Launch a separate thread for each peer
 		go func(peerIndex int) {
-			result := rf.AppendAndSync(peerIndex, command)
+			result := rf.AppendAndSync(peerIndex, command, newLogIndex)
 			commitResult <- result
 		}(i)
 	}
@@ -422,7 +478,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// It appears that the tester expects there to be a Start return
 	// and then a nCommitted after some tester sleep period to
 	// check that there is not a committment without a majority.
-
 	go func() {
 		append_count := 1 // start at 1 for leader
 		return_count := 1
@@ -433,18 +488,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.me, command)
 				append_count++
 				if append_count > (len(rf.peers) / 2) {
-					// Leader commit after majority occurs
-					msg := ApplyMsg{true, rf.log[newCommitIndex].AnyValue, newCommitIndex,
-						false, nil, 0, 0}
-					rf.applyCh <- msg
 					// Increment the commit index
 					rf.mu.Lock()
 					rf.commitIndex++
-					rf.mu.Unlock()
+					msg := ApplyMsg{true, rf.log[rf.commitIndex].AnyValue,
+						rf.commitIndex, false, nil, 0, 0}
+					rf.applyCh <- msg
 					Debug(dLeader, "S%d Leader, Committed Entry!"+
-						"Index: %d Term=%d Cmd=%d",
-						rf.me, newCommitIndex, rf.log[newCommitIndex].IntValue,
-						rf.log[newCommitIndex].AnyValue)
+						"Index:%d Term=%d Cmd=%d",
+						rf.me, newLogIndex, rf.log[newLogIndex].IntValue,
+						rf.log[newLogIndex].AnyValue)
+					rf.mu.Unlock()
 					break
 				}
 			} else {
@@ -461,7 +515,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}()
 	// Set the index to notify the tester that we think this log is
 	// *maybe* committed on the majority of servers.
-	return newCommitIndex, term, isLeader
+	return newLogIndex, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -488,125 +542,105 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	leaderTerm := args.Term
-	followerTerm := rf.currentTerm
 
-	// Case 1: Leader has a higher or equal term
-	// We accept this leader iff
-	// log is as long as prevCommitIndex and last index matches expected term
-	if leaderTerm >= followerTerm {
+	reply.Success = true
+	reply.Term = rf.currentTerm
 
-		if leaderTerm > followerTerm {
-			rf.currentTerm = args.Term // Update term to latest
-			rf.currentState = Follower // Immediately revert to follower state
-		}
-
-		if args.Entries != nil {
-			// Log is at least as up to date, and the last entry is the same
-			// previous commit in the raft's log matches the append RPC previous commit
-			// by checking the the previous index exists in this raft's log
-			// and stores the previous term
-			if args.PrevLogIndex != len(rf.log) {
-				// Reject leader due to missing entries
-				Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
-					">= term case with entries. Error: missing entries. "+
-					"Follower: log length=%d "+
-					"Leader: prevIndex=%d prevTerm=%d ",
-					rf.me, args.Term, len(rf.log),
-					args.PrevLogIndex, args.PrevLogTerm)
-				reply.Success = false
-			} else if len(rf.log) > 0 &&
-				rf.log[args.PrevLogIndex].IntValue != args.PrevLogTerm {
-				// Reject leader due to mismatched entries
-				Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
-					">= term case with entries. Error: mismatched entries. "+
-					"Follower: Log len=%d, log[prevIndex].Term=%d\n"+
-					"Leader: prevIndex=%d, prevTerm=%d",
-					rf.me, args.Term, len(rf.log), rf.log[args.PrevLogIndex].IntValue,
-					args.PrevLogIndex, args.PrevLogTerm)
-				reply.Success = false
-			} else {
-				// Accept leader and append log
-				rf.votedFor = 0
-				reply.Success = true
-				rf.heartBeatReceived = true
-
-				// bulk add during consistency fix
-				for i := 0; i < len(args.Entries); i++ {
-					// Add each of the entries
-					Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
-						">= term case with entries. Saving log! [total size=%d]"+
-						"Index: %d Term=%d Cmd=%d",
-						rf.me, args.Term, len(rf.log),
-						args.LeaderCommit, args.Entries[args.LeaderCommit].IntValue,
-						args.Entries[args.LeaderCommit].AnyValue)
-					rf.log[args.LeaderCommit] = args.Entries[args.LeaderCommit]
-					args.LeaderCommit++
-				}
-
-				// rf.log[args.LeaderCommit] = args.Entries[args.LeaderCommit]
-
-				// Commit entry to statemachine
-				// the leader and by proxy a majority of peers
-				// have also committed the log.
-				if rf.commitIndex < args.PrevLogIndex &&
-					len(rf.log) == args.PrevLogIndex {
-					Debug(dCommit, "S%d LOGAN WARNING1: %d %d",
-						rf.commitIndex, args.PrevLogIndex)
-					// Handle more than 1 lagging log
-					for rf.commitIndex < args.PrevLogIndex {
-						rf.commitIndex++
-						msg := ApplyMsg{true, rf.log[rf.commitIndex].AnyValue,
-							rf.commitIndex, false, nil, 0, 0}
-						rf.applyCh <- msg
-						Debug(dCommit, "S%d Follower, AppendRPC received on term %d "+
-							">= case with notify update. Committed new entry!"+
-							"Index: %d Term=%d Cmd=%d",
-							rf.me, args.Term,
-							rf.commitIndex, rf.log[rf.commitIndex].IntValue,
-							rf.log[rf.commitIndex].AnyValue)
-					}
-				}
-			}
-		} else {
-			// Accept leader (nil entries)
-			Debug(dLog, "S%d Follower, AppendRPC received on term %d "+
-				">= term case with nill entries. Accept heartbeat.",
-				rf.me, args.Term)
-			rf.votedFor = 0
-			reply.Success = true
-			rf.heartBeatReceived = true
-
-			// Commit outstanding entries
-			// if the leader and by proxy a majority of the peers
-			// have accepted the entry
-			// TBD - handle more than 1 lagging log
-			if args.PrevLogIndex > rf.commitIndex &&
-				len(rf.log) == args.PrevLogIndex {
-				Debug(dCommit, "S%d LOGAN WARNING2: %d %d",
-					rf.me, rf.commitIndex, args.PrevLogIndex)
-				// Handle more than 1 lagging log
-				for rf.commitIndex < args.PrevLogIndex {
-					rf.commitIndex++
-					msg := ApplyMsg{true, rf.log[rf.commitIndex].AnyValue,
-						rf.commitIndex, false, nil, 0, 0}
-					rf.applyCh <- msg
-					Debug(dCommit, "S%d Follower, AppendRPC received on term %d "+
-						">= case with notify update. Committed new entry!"+
-						"Index: %d Term=%d Cmd=%d",
-						rf.me, args.Term,
-						rf.commitIndex, rf.log[rf.commitIndex].IntValue,
-						rf.log[rf.commitIndex].AnyValue)
-				}
-			}
-		}
-		return
+	// TODO remove print
+	if args.Entries != nil {
+		Debug(dInfo, "S%d Follower - received AppendEntries index=%d term=%d cmd=%d"+
+			" total len %d",
+			rf.me, args.PrevLogIndex+1, args.Entries[args.PrevLogIndex+1].IntValue,
+			args.Entries[args.PrevLogIndex+1].AnyValue, len(args.Entries))
 	}
 
-	// Case 2: Leader has lower term - instant rejection.
-	Debug(dLog, "S%d Follower, received AppendRPC with lower term=%d, cur=%d"+
-		", rejecting...", rf.me, leaderTerm, followerTerm)
-	reply.Success = false
+	// Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	} else if args.Term > rf.currentTerm {
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower
+		rf.currentTerm = args.Term
+		rf.currentState = Follower
+	}
+
+	// Reply false if log doesn't contain an entry at prevLogIndex
+	// whose term matches prevLogTerm
+	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].IntValue {
+		Debug(dInfo, "S%d Follower - received AppendEntries BACKUP", rf.me)
+		// Fast Backup
+		// term of the conflicting entry
+		if args.PrevLogIndex > 0 {
+			reply.XTerm = rf.log[args.PrevLogIndex].IntValue
+		} else {
+			reply.XTerm = -1
+		}
+
+		// Find the first index of XTerm
+		index := args.PrevLogIndex
+		for rf.log[index].IntValue == rf.log[args.PrevLogIndex].IntValue {
+			if index > 0 {
+				index--
+			} else {
+				break
+			}
+		}
+		reply.XIndex = index + 1
+		reply.XLen = len(rf.log)
+		reply.Success = false
+	}
+
+	rf.heartBeatReceived = true
+
+	if reply.Success {
+		// If an existing entry conflicts with a new one (same index
+		// but different terms), delete the existing entry and all that
+		// follow it
+		for index := range args.Entries {
+			if rf.log[index].IntValue > 0 && rf.log[index].IntValue != args.Entries[index].IntValue {
+				Debug(dDrop, "S%d Follower, dropping mismatch Index=%d Term=%d"+
+					" Does not match expected Term=%d Cmd=%d"+
+					" size of args.Entries=%d, args.PrevLogIndex:%d"+
+					" i=%d",
+					rf.me, index, rf.log[index].IntValue, args.Entries[index].IntValue,
+					args.Entries[index].AnyValue, len(args.Entries), args.PrevLogIndex, index)
+				delete(rf.log, index)
+			}
+		}
+
+		// Append any new entries not already in the log
+		for index := range args.Entries {
+			if rf.log[index].IntValue == 0 {
+				rf.log[index] = args.Entries[index]
+				Debug(dLog, "S%d Follower, Logging new entry! [total size=%d]"+
+					"Index: %d Term=%d Cmd=%d",
+					rf.me, len(rf.log), index,
+					args.Entries[index].IntValue, args.Entries[index].AnyValue)
+			}
+		}
+
+		// If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+		}
+	}
+
+	// If commitIndex > lastApplied: increment lastApplied, apply
+	// log[lastApplied] to state machine
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		msg := ApplyMsg{true, rf.log[rf.lastApplied].AnyValue,
+			rf.lastApplied, false, nil, 0, 0}
+		rf.applyCh <- msg
+		Debug(dCommit, "S%d Follower, Committed new entry on term %d!"+
+			" Index: %d Term=%d Cmd=%d",
+			rf.me, args.Term,
+			rf.lastApplied, rf.log[rf.lastApplied].IntValue,
+			rf.log[rf.lastApplied].AnyValue)
+	}
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -615,30 +649,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // Starts the leader logic for elected raft
-// Sends heartbeat every to all servers
-func (rf *Raft) leaderHeatbeat() {
-	Debug(dTimer, "S%d Leader, Heartbeat started", rf.me)
-	// Leader Id
+// Sends Heartbeat every to all servers
+func (rf *Raft) leaderHeartbeat() {
+	Debug(dLeader, "S%d Leader, starting heartbeat", rf.me)
 	rf.leaderId = rand.Int63()
+
 	for !rf.killed() {
 		_, isLeader := rf.GetState()
 		if !isLeader {
-			Debug(dTimer, "S%d Leader, stopping leader", rf.me)
-			// No longer leader, stop sending heartbeats
+			Debug(dLeader, "S%d Leader, stopping heartbeat", rf.me)
 			return
 		}
 
-		// Send the heartbeat append RPC entries
-		// contains previous commit index (same as when initialized, or incremented with newly committed indexes
-		// contains nil entries
-		// contains leaders commit index, which is the same as the currentIndex as nothing is being committed.
-
-		// TODO - need some check to determine if we can send the very last log
-		// or the log before last (depending on if we committed)
-
-		// TODO - the heartbeat should be able to check that the accepted
-		// rafts have reached consensus on the latest log entry
-		// and if not, then the backup append RPCs' should be launched.
+		// Send the Heartbeat appendEntriesRPC
 		args := AppendEntriesArgs{rf.currentTerm, rf.leaderId, rf.commitIndex,
 			rf.log[rf.commitIndex].IntValue, nil, rf.commitIndex}
 		for i := range rf.peers {
@@ -651,25 +674,20 @@ func (rf *Raft) leaderHeatbeat() {
 				reply := AppendEntriesReply{}
 				rf.sendAppendEntries(peerIndex, &args, &reply)
 
-				// false return means that the follower does not contain
-				// matching entry for rf.commitIndex
-
+				// Heartbeat rejected
 				if !reply.Success {
-					// Consistency check failed
+					// Consistency check
 					Debug(dError, "S%d Leader, consistency check failed for S%d",
 						rf.me, peerIndex)
-					// TBD - should I launch consistency fix RPCs if the
-					// false return is caused by a disconnect?
-					// TBD - how do I decide that this heartbeat had failed previously
-					// and these have already been launched?
-					rf.AppendAndSync(peerIndex, nil)
+					// Pass commitIndex+1 as we will back up one in common code
+					rf.AppendAndSync(peerIndex, nil, rf.commitIndex+1)
 
 				}
-			}(i) // Pass 'i' as an argument to the function
+			}(i)
 		}
 
 		// Heartbeat timeout - sleep for specified time.
-		time.Sleep(time.Duration(heartbeatTimeout) * time.Millisecond)
+		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 	}
 }
 
@@ -705,7 +723,7 @@ func (rf *Raft) electionTicker() {
 		// Election timeout went off, let's reset state to allow
 		// this raft to vote in other elections.
 		if rf.heartBeatReceived {
-			// If a heartBeat has been received, reset check.
+			// If a HeartBeat has been received, reset check.
 			rf.heartBeatReceived = false
 		} else {
 			// Convert to candidate
@@ -713,7 +731,7 @@ func (rf *Raft) electionTicker() {
 		}
 
 		// Candidate
-		// If a heartBeat has NOT been received, hold an election.
+		// If a HeartBeat has NOT been received, hold an election.
 		if startElection {
 			rf.currentState = Candidate // Set to Candidate state
 			candidateId := rand.Int63() // Grab new ID
@@ -789,23 +807,20 @@ func (rf *Raft) electionTicker() {
 			// Election results
 			if majorityVote {
 				// Won election, become leader
-				Debug(dVote, "S%d Candidate, got a majority vote!", rf.me)
+				Debug(dVote, "S%d Candidate, won a majority vote!", rf.me)
 				rf.currentState = Leader
 				// Start the leader routine
-				go rf.leaderHeatbeat()
+				go rf.leaderHeartbeat()
 			} else {
 				// Lost the election
-				Debug(dVote, "S%d Candidate, lost the vote!", rf.me)
+				Debug(dVote, "S%d Candidate, lost the election!", rf.me)
 			}
-			rf.mu.Unlock()
-		} else {
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 
 		wg.Wait() // Wait for election timer
 
 	} // end for
-
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -840,6 +855,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.nextIndex = make(map[int]int)
+	// nextIndex initialized to leader last log + 1
+	for i := range rf.peers {
+		rf.nextIndex[i] = 1
+	}
+
 	rf.matchindex = make(map[int]int)
 
 	// initialize from state persisted before a crash

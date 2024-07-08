@@ -62,3 +62,11 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 		log.Printf(format, a...)
 	}
 }
+
+// min function for integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
