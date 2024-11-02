@@ -30,7 +30,8 @@ import (
 
 // Globals timeouts (ms)
 var electionTimeout int64 = 500
-var HeartbeatTimeout int64 = 50
+
+const HeartbeatTimeout = 100 * time.Millisecond
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -62,9 +63,10 @@ const (
 )
 
 // Define a struct to hold the integer and interface{}
-type IntAndInterface struct {
-	IntValue int
-	AnyValue interface{}
+// This is used in the uncommitted log for the Index and the Command
+type TermAndCommand struct {
+	Term    int
+	Command interface{}
 }
 
 // A Go object implementing a single Raft peer.
@@ -75,13 +77,13 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (3A, 3B, 3C).
+	// Channel to send the committed entries
 	applyCh chan ApplyMsg
 
 	// Persistent state
 	currentTerm int
 	votedFor    int64
-	log         map[int]IntAndInterface
+	log         map[int]TermAndCommand
 
 	// Volatile state
 	currentState      RaftState
@@ -91,9 +93,6 @@ type Raft struct {
 	lastApplied       int
 	nextIndex         map[int]int
 	matchindex        map[int]int
-
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 }
 
 // return currentTerm and whether this server
@@ -156,17 +155,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
+// RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
-	Term         int
-	CandidateId  int64
-	LastLogIndex int
-	LastLogTerm  int
+	CandidateId             int64
+	CandidateTerm           int
+	CandidateLastLoggedTerm int
+	CandidateLogLength      int
 }
 
-// example RequestVote RPC reply structure.
+// RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	Term        int
@@ -180,7 +178,7 @@ type AppendEntriesArgs struct {
 	// 3B
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      map[int]IntAndInterface
+	Entries      map[int]TermAndCommand
 	LeaderCommit int
 }
 
@@ -192,65 +190,65 @@ type AppendEntriesReply struct {
 	XTerm  int // Term of the conflicting entry
 	XIndex int // Index of the first entry w/ XTerm
 	XLen   int // Length of the log
-
 }
 
 // RequestVote RPC handler.
+// Votes for valid candidates with accept or reject
+// based on case[1], case[2]
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
+	// Acquire lock
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Debug(dTimer, "S%d Follower, received requestVote for term %d", rf.me, args.Term)
-	// TODO clean this up
+	// Variables
+	currentTerm := rf.currentTerm
+	lastLoggedTerm := rf.log[rf.commitIndex].Term
+	votedFor := rf.votedFor
+	logLength := len(rf.log)
+	candidateTerm := args.CandidateTerm
+	candidateId := args.CandidateId
+	candidateLastLoggedTerm := args.CandidateLastLoggedTerm
+	candidateLogLength := args.CandidateLogLength
 
-	candidateTerm := args.Term
-	followerTerm := rf.currentTerm
+	// initialize RequestVoteReply to reject
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 
-	// Case 1: candidate has a lower term
-	if candidateTerm < followerTerm {
-		// Reject candidate
-		Debug(dVote, "S%d Follower, reject vote for %d due to smaller term %d.",
-			rf.me, args.CandidateId, args.Term)
-		reply.VoteGranted = false
+	// if the candidate's term is higher, regardless of whether
+	// we voted yes, we need to become a follower and sync terms
+	if candidateTerm > currentTerm {
+		rf.currentState = Follower     // Set this raft's state to Follower
+		rf.currentTerm = candidateTerm // Sync terms
+	}
+
+	// Case[1]: candidate has a lower term
+	// Reject candidate
+	if candidateTerm < currentTerm {
+		Debug(dVote, "S%d Follower, rejected candidate %d due to smaller term %d.",
+			rf.me, args.CandidateId, args.CandidateTerm)
 		return
 	}
 
-	// Case 2: candidate has a greater or equal term
-	// Grant vote iff votedFor is null or candidateID
-	// and log is at least as up-to-date as candidate
+	// Case[2]: candidate has a greater or equal term
+	// Accept candidate under conditions:
+	// 		[a]. this raft has not voted this term or already voted this candidate
+	//			 meaning the votedFor is null or equal to candidate ID
+	//		[b]. the candidate log is at least as up-to-date
+	//			 where up-to-date means the candidate's last log entry
+	//			 is a higher term or if it is equal then make sure
+	//			 the candidates log is at least as long
 
-	// 5.4.1 Election restriction:
-	// vote yes only if higher term in last entry, OR
-	// same last term && logs are each greater than or equal to eachother
-
-	if (candidateTerm > followerTerm ||
-		rf.votedFor == 0 ||
-		rf.votedFor == args.CandidateId) &&
-		(args.LastLogTerm > rf.log[rf.commitIndex].IntValue ||
-			args.LastLogTerm == rf.log[rf.commitIndex].IntValue &&
-				args.LastLogIndex >= rf.commitIndex) {
-		Debug(dVote, "S%d Follower, granting vote to %d same/greater term %d.", rf.me,
-			args.CandidateId, args.Term)
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		rf.currentState = Follower
-		// Update the term to sync
-		rf.currentTerm = args.Term
-	} else {
-		if candidateTerm > followerTerm {
-			rf.currentState = Follower
+	// condition [a]
+	if candidateTerm > currentTerm || votedFor == 0 || votedFor == candidateId {
+		// condition [b]
+		if candidateLastLoggedTerm > lastLoggedTerm ||
+			(candidateLastLoggedTerm == lastLoggedTerm && candidateLogLength >= logLength) {
+			reply.VoteGranted = true  // Accept candidate
+			rf.votedFor = candidateId // Set votedFor to this candidate
+			Debug(dVote, "S%d Follower, granting vote to %d same/greater term %d.", rf.me,
+				args.CandidateId, args.CandidateTerm)
 		}
-		Debug(dVote, "S%d Follower, failed vote to %d "+
-			"same/greater term %d: "+
-			"args.LastLogIndex=%d args.LastLogTerm=%d "+
-			" rf.commitIndex=%d rf.log[rf.commitIndex].IntValue=%d ",
-			rf.me, args.CandidateId, args.Term,
-			args.LastLogIndex, args.LastLogTerm,
-			rf.commitIndex, rf.log[rf.commitIndex].IntValue)
-		reply.VoteGranted = false
-		// Update the term to sync
-		rf.currentTerm = args.Term
 	}
 }
 
@@ -291,7 +289,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // also handles the back up procedure upon rejection
 func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
-	newEntries := make(map[int]IntAndInterface)
+	newEntries := make(map[int]TermAndCommand)
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 	reply.Success = false
@@ -331,7 +329,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 				// Check if leader has the follower's mismatched term
 				found := -1
 				for i := 1; i < len(rf.log); i++ {
-					if rf.log[i].IntValue == reply.XTerm {
+					if rf.log[i].Term == reply.XTerm {
 						found = i
 						break
 					}
@@ -363,7 +361,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
 		prevLogIndex := rf.nextIndex[server] - 1
 		args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, prevLogIndex,
-			rf.log[prevLogIndex].IntValue, newEntries, rf.commitIndex}
+			rf.log[prevLogIndex].Term, newEntries, rf.commitIndex}
 		rf.mu.Unlock()
 
 		// Block on send call as we are already threaded for each raft
@@ -410,7 +408,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	// 1. Append the log to it's own (do not notify client success yet)
-	rf.log[len(rf.log)+1] = IntAndInterface{rf.currentTerm, command}
+	rf.log[len(rf.log)+1] = TermAndCommand{rf.currentTerm, command}
 	logIndex := len(rf.log)
 	Debug(dLeader, "S%d Leader, Start() has been called for cmd: %d!",
 		rf.me, command)
@@ -455,13 +453,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					// Apply log to state machine in-order
 					for rf.lastApplied < rf.commitIndex {
 						rf.lastApplied++
-						msg := ApplyMsg{true, rf.log[rf.lastApplied].AnyValue,
+						msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
 							rf.lastApplied, false, nil, 0, 0}
 						rf.applyCh <- msg
 						Debug(dLeader, "S%d Leader, Committing Entry!"+
 							"Index:%d Term=%d Cmd=%d",
-							rf.me, rf.lastApplied, rf.log[rf.lastApplied].IntValue,
-							rf.log[rf.lastApplied].AnyValue)
+							rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term,
+							rf.log[rf.lastApplied].Command)
 					}
 					rf.mu.Unlock()
 					break
@@ -528,18 +526,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].IntValue {
+	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		// Fast Backup
 		// term of the conflicting entry
 		if args.PrevLogIndex > 0 {
-			reply.XTerm = rf.log[args.PrevLogIndex].IntValue
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
 		} else {
 			reply.XTerm = -1
 		}
 
 		// Find the first index of XTerm
 		index := args.PrevLogIndex
-		for rf.log[index].IntValue == rf.log[args.PrevLogIndex].IntValue {
+		for rf.log[index].Term == rf.log[args.PrevLogIndex].Term {
 			if index > 0 {
 				index--
 			} else {
@@ -559,11 +557,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// follow it - in order
 		for index := args.PrevLogIndex + 1; index <= args.PrevLogIndex+len(args.Entries); index++ {
 			if _, exists := rf.log[index]; exists {
-				if rf.log[index].IntValue != args.Entries[index].IntValue {
+				if rf.log[index].Term != args.Entries[index].Term {
 					Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
 						" Follower's Term=%d Cmd=%d Leader's Term=%d Cmd=%d",
-						rf.me, index, rf.log[index].IntValue, rf.log[index].AnyValue,
-						args.Entries[index].IntValue, args.Entries[index].AnyValue)
+						rf.me, index, rf.log[index].Term, rf.log[index].Command,
+						args.Entries[index].Term, args.Entries[index].Command)
 					delete(rf.log, index)
 				}
 			}
@@ -577,7 +575,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for index := args.PrevLogIndex + 1; index <= args.PrevLogIndex+len(args.Entries); index++ {
 
 			// If the cmd for the calcualted index is nil, then the true index must already be committed
-			if args.Entries[index].AnyValue == nil {
+			if args.Entries[index].Command == nil {
 				return
 			}
 
@@ -586,11 +584,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Debug(dLog, "S%d Follower, Logging new entry! "+
 					" Size=%d Index=%d Term=%d Cmd=%d",
 					rf.me, len(rf.log), index,
-					args.Entries[index].IntValue, args.Entries[index].AnyValue)
+					args.Entries[index].Term, args.Entries[index].Command)
 			}
 
 			// TODO remove -- DEBUG
-			if args.Entries[index].AnyValue == nil {
+			if args.Entries[index].Command == nil {
 				Debug(dError, "S%d Follower, logging a new nil entry w/ PrevLogIndex=%d!!"+
 					" Size of entries is %d ",
 					rf.me, args.PrevLogIndex, len(args.Entries))
@@ -607,14 +605,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// log[lastApplied] to state machine
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			msg := ApplyMsg{true, rf.log[rf.lastApplied].AnyValue,
+			msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
 				rf.lastApplied, false, nil, 0, 0}
 			rf.applyCh <- msg
 			Debug(dCommit, "S%d Follower, Committing new entry on term%d, lastApplied:%d!"+
 				" Index: %d Term=%d Cmd=%d",
 				rf.me, args.Term, rf.lastApplied,
-				rf.lastApplied, rf.log[rf.lastApplied].IntValue,
-				rf.log[rf.lastApplied].AnyValue)
+				rf.lastApplied, rf.log[rf.lastApplied].Term,
+				rf.log[rf.lastApplied].Command)
 		}
 	}
 
@@ -625,39 +623,32 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// Starts the leader logic for elected raft
-// Sends Heartbeat every to all servers
+// leaderHeartbeat starts the heartbeat process for a leader Raft instance.
+// Sends a heartbeat (AppendEntries) RPC to all peers at a regular interval.
 func (rf *Raft) leaderHeartbeat() {
 	Debug(dLeader, "S%d Leader, starting heartbeat", rf.me)
 	rf.leaderId = rand.Int63()
 
-	for !rf.killed() {
-		_, isLeader := rf.GetState()
-		if !isLeader {
-			Debug(dLeader, "S%d Leader, stopping heartbeat", rf.me)
-			return
-		}
-
-		// Send the Heartbeat appendEntriesRPC
-		//	args := AppendEntriesArgs{rf.currentTerm, rf.leaderId, rf.commitIndex,
-		//		rf.log[rf.commitIndex].IntValue, nil, rf.commitIndex}
+	// Helper function to send heartbeats
+	sendHeartbeats := func() {
 		for i := range rf.peers {
-			// Skip self
-			if i == rf.me {
+			if i == rf.me { // Skip self
 				continue
 			}
-			// Launch the AppendEntries RPCs in parallel
-			go func(peerIndex int) {
-				// use length of the log in case this leader has uncommitted entries
-				rf.AppendAndSync(peerIndex, len(rf.log), true)
-
-			}(i)
-
+			go rf.AppendAndSync(i, len(rf.log), true) // Send RPC in parallel
 		}
-
-		// Heartbeat timeout - sleep for specified time.
-		time.Sleep(time.Duration(HeartbeatTimeout) * time.Millisecond)
 	}
+
+	// Heartbeat loop
+	ticker := time.NewTicker(HeartbeatTimeout)
+	defer ticker.Stop()
+
+	for !rf.killed() && rf.isLeader() {
+		sendHeartbeats()
+		<-ticker.C // Wait for next heartbeat interval
+	}
+
+	Debug(dLeader, "S%d Leader, stopping heartbeat", rf.me)
 }
 
 // election timeout for all rafts
@@ -711,8 +702,8 @@ func (rf *Raft) electionTicker() {
 				rf.me, candidateId, rf.currentTerm)
 
 			// Set term information for filtering election candidates
-			args := RequestVoteArgs{rf.currentTerm, candidateId,
-				rf.commitIndex, rf.log[rf.commitIndex].IntValue}
+			args := RequestVoteArgs{candidateId, rf.currentTerm,
+				rf.log[len(rf.log)].Term, len(rf.log)}
 
 			// Send requestVote RPC to all known rafts in parallel
 			vote_results := make(chan bool, len(rf.peers)-1)
@@ -822,7 +813,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Persistent state
 	rf.currentTerm = 0
 	rf.votedFor = 0
-	rf.log = make(map[int]IntAndInterface)
+	rf.log = make(map[int]TermAndCommand)
 
 	// Volatile state
 	rf.currentState = Follower

@@ -70,3 +70,8 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func (rf *Raft) isLeader() bool {
+	_, isLeader := rf.GetState()
+	return isLeader
+}
