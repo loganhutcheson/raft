@@ -71,7 +71,26 @@ func min(a, b int) int {
 	return b
 }
 
+// min function for integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (rf *Raft) isLeader() bool {
 	_, isLeader := rf.GetState()
 	return isLeader
+}
+
+func (rf *Raft) lastLogTerm() int {
+	if len(rf.log) == 0 {
+		return 0
+	}
+	return rf.log[len(rf.log)-1].Term
+}
+
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log)
 }

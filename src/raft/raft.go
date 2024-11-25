@@ -234,7 +234,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Accept candidate under conditions:
 	// 		[a]. this raft has not voted this term or already voted this candidate
 	//			 meaning the votedFor is null or equal to candidate ID
-	//		[b]. the candidate log is at least as up-to-date
+	//		[b]. *important election restriction*
+	//			 that effectively gives power to the highest term/longest log
+	//			 due to the implicit fact that winning elections requires a majority,
+	//			 and you must win the election to even add to the log
+	//		     rule: the candidate log is at least as up-to-date
 	//			 where up-to-date means the candidate's last log entry
 	//			 is a higher term or if it is equal then make sure
 	//			 the candidates log is at least as long
@@ -294,11 +298,18 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 	reply := AppendEntriesReply{}
 	reply.Success = false
 	reply.Term = 0
+	reply.XLen = 0
+
 	for !reply.Success {
+
+		// Acquire lock
+		rf.mu.Lock()
 
 		// Check if we are still leader
 		_, isLeader := rf.GetState()
 		if !isLeader {
+			// Release lock
+			rf.mu.Unlock()
 			return false
 		}
 
@@ -306,18 +317,13 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 		// higher term, then we don't try to fix consistency
 		// revert back to follower
 		if reply.Term > rf.currentTerm {
-			rf.mu.Lock()
 			rf.currentState = Follower
+			// Release lock
 			rf.mu.Unlock()
 			return false
 		}
 
-		// Maintain a nextIndex field (one for each follower)
-		// in response to errors, we decrement the nextIndex field
-		// and resend the append entry RPC to the failed server
-
 		// Fast Backup
-		rf.mu.Lock()
 		if reply.XLen > 0 {
 			if reply.XTerm == -1 {
 				// Follower does not have an entry for this index
@@ -325,6 +331,9 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 				Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (case 1)",
 					rf.me, server, reply.XLen)
 				rf.nextIndex[server] = reply.XLen
+				if heartbeat {
+					Debug(dInfo, "S%d Leader - heartbeat", rf.me)
+				}
 			} else {
 				// Check if leader has the follower's mismatched term
 				found := -1
@@ -360,22 +369,35 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 		}
 
 		prevLogIndex := rf.nextIndex[server] - 1
-		args = AppendEntriesArgs{rf.currentTerm, rf.leaderId, prevLogIndex,
-			rf.log[prevLogIndex].Term, newEntries, rf.commitIndex}
+		prevLogTerm := rf.log[prevLogIndex].Term
+
+		// Reset Reply to avoid labgob decode error
+		reply = AppendEntriesReply{}
+
+		args = AppendEntriesArgs{rf.currentTerm, rf.leaderId,
+			prevLogIndex, prevLogTerm, newEntries, rf.commitIndex}
+
+		// Release lock
 		rf.mu.Unlock()
 
-		// Block on send call as we are already threaded for each raft
+		// Block on send
 		rf.sendAppendEntries(server, &args, &reply)
 
 	}
+
 	// Successful commit by this raft
 	// Set nextIndex, so we know which is the next log to commit.
 	// Increment the matchIndex so we know we commited a new log.
 	rf.mu.Lock()
-	rf.nextIndex[server] = logIndex + 1
-	rf.matchindex[server] = logIndex
-	Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
-		rf.me, server, logIndex+1)
+	// TBD - what is stopping this from occuring on heartbeat?
+	if heartbeat {
+		Debug(dInfo, "S%d Leader - heartbeat", rf.me)
+	} else {
+		rf.nextIndex[server] = logIndex + 1
+		rf.matchindex[server] = logIndex
+		Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
+			rf.me, server, logIndex+1)
+	}
 	rf.mu.Unlock()
 
 	return true
@@ -439,8 +461,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		for result := range commitResult {
 			return_count++
 			if result {
-				Debug(dLeader, "S%d Leader, got an approval for log %d!",
-					rf.me, command)
+				Debug(dLeader, "S%d Leader, got an approval for log %d to index %d!",
+					rf.me, command, logIndex)
 				append_count++
 				if append_count > (len(rf.peers) / 2) {
 					rf.mu.Lock()
@@ -456,7 +478,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 						msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
 							rf.lastApplied, false, nil, 0, 0}
 						rf.applyCh <- msg
-						Debug(dLeader, "S%d Leader, Committing Entry!"+
+						Debug(dCommit, "S%d Leader, Committing Entry!"+
 							"Index:%d Term=%d Cmd=%d",
 							rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term,
 							rf.log[rf.lastApplied].Command)
@@ -503,119 +525,119 @@ func (rf *Raft) killed() bool {
 // AppendEntries RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
+	// Acquire Lock
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Success = true
-	reply.Term = rf.currentTerm
-	reply.XLen = len(rf.log)
+	leadersTerm := args.Term
+	leadersCommit := args.LeaderCommit
+	prevLogIndex := args.PrevLogIndex
+	prevLogTerm := args.PrevLogTerm
 
-	// Reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
+	// [1] Reply false if term < currentTerm
+	if leadersTerm < rf.currentTerm {
 		reply.Success = false
-		reply.Term = rf.currentTerm
 		return
-	} else if args.Term > rf.currentTerm {
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower
+	} else {
+		rf.heartBeatReceived = true
+	}
+	// [2] Reply false if log doesn't contain an entry at prevLogIndex
+	// whose term matches prevLogTerm
+	if rf.log[prevLogIndex].Term != prevLogTerm {
 		reply.Success = false
-		rf.currentTerm = args.Term
-		rf.currentState = Follower
+		// Fast Backup
+		if rf.log[prevLogIndex].Term != 0 {
+			// Follower has a conflicting Xterm at PrevLogIndex
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			// Find the first index of XTerm in the follower's log
+			index := args.PrevLogIndex
+			for rf.log[index].Term == reply.XTerm {
+				if index > 0 {
+					index--
+				} else {
+					break
+				}
+			}
+			reply.XIndex = index + 1
+			reply.XLen = len(rf.log)
+			return
+		} else {
+			// Follower has no entry at PrevLogIndex
+			reply.XTerm = -1
+			reply.XIndex = -1
+			reply.XLen = len(rf.log)
+		}
 		return
 	}
 
-	// Reply false if log doesn't contain an entry at prevLogIndex
-	// whose term matches prevLogTerm
-	if args.PrevLogIndex > 0 && args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		// Fast Backup
-		// term of the conflicting entry
-		if args.PrevLogIndex > 0 {
-			reply.XTerm = rf.log[args.PrevLogIndex].Term
-		} else {
-			reply.XTerm = -1
-		}
-
-		// Find the first index of XTerm
-		index := args.PrevLogIndex
-		for rf.log[index].Term == rf.log[args.PrevLogIndex].Term {
-			if index > 0 {
-				index--
-			} else {
+	// [3] Perform consistency check
+	// Note: this check needs to occur for both heartbeats and AppendRPC
+	// containing new entries.
+	// If an existing entry conflicts with a new one (same index but
+	// different terms), delete the existing entry and all the follow it.
+	// if len(args.Entries) > 0 {
+	indexRange := prevLogIndex + len(args.Entries)
+	mismatch := false
+	mismatchIndex := 0
+	for index := (prevLogIndex + 1); index <= indexRange; index++ {
+		// First check if the index exists in the follower's log
+		if rf.log[index].Term != 0 {
+			if rf.log[index].Term != args.Entries[index].Term {
+				mismatch = true
+				mismatchIndex = index
 				break
 			}
 		}
-		reply.XIndex = index + 1
-		reply.XLen = len(rf.log)
-		reply.Success = false
 	}
-
-	if reply.Success {
-		rf.heartBeatReceived = true
-
-		// If an existing entry conflicts with a new one (same index
-		// but different terms), delete the existing entry and all that
-		// follow it - in order
-		for index := args.PrevLogIndex + 1; index <= args.PrevLogIndex+len(args.Entries); index++ {
-			if _, exists := rf.log[index]; exists {
-				if rf.log[index].Term != args.Entries[index].Term {
-					Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
-						" Follower's Term=%d Cmd=%d Leader's Term=%d Cmd=%d",
-						rf.me, index, rf.log[index].Term, rf.log[index].Command,
-						args.Entries[index].Term, args.Entries[index].Command)
-					delete(rf.log, index)
-				}
-			}
-		}
-
-		// Append any new entries not already in the log - in order
-
-		// TBD - in what case would args.PrevLogIndex + len(args.Entries)
-		// calculate to an index that is not included in args.Entries (i.e. null)
-
-		for index := args.PrevLogIndex + 1; index <= args.PrevLogIndex+len(args.Entries); index++ {
-
-			// If the cmd for the calcualted index is nil, then the true index must already be committed
-			if args.Entries[index].Command == nil {
-				return
-			}
-
-			if _, exists := rf.log[index]; !exists {
-				rf.log[index] = args.Entries[index]
-				Debug(dLog, "S%d Follower, Logging new entry! "+
-					" Size=%d Index=%d Term=%d Cmd=%d",
-					rf.me, len(rf.log), index,
-					args.Entries[index].Term, args.Entries[index].Command)
-			}
-
-			// TODO remove -- DEBUG
-			if args.Entries[index].Command == nil {
-				Debug(dError, "S%d Follower, logging a new nil entry w/ PrevLogIndex=%d!!"+
-					" Size of entries is %d ",
-					rf.me, args.PrevLogIndex, len(args.Entries))
-			}
-		}
-
-		// If leaderCommit > commitIndex, set commitIndex =
-		// min(leaderCommit, index of last new entry)
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
-		}
-
-		// If commitIndex > lastApplied: increment lastApplied, apply
-		// log[lastApplied] to state machine
-		for rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-			msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
-				rf.lastApplied, false, nil, 0, 0}
-			rf.applyCh <- msg
-			Debug(dCommit, "S%d Follower, Committing new entry on term%d, lastApplied:%d!"+
-				" Index: %d Term=%d Cmd=%d",
-				rf.me, args.Term, rf.lastApplied,
-				rf.lastApplied, rf.log[rf.lastApplied].Term,
-				rf.log[rf.lastApplied].Command)
+	if mismatch {
+		for index := mismatchIndex; mismatchIndex <= len(rf.log); index++ {
+			Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
+				" Follower's Term=%d Cmd=%d Leader's Term=%d Cmd=%d",
+				rf.me, index, rf.log[index].Term, rf.log[index].Command,
+				args.Entries[index].Term, args.Entries[index].Command)
+			delete(rf.log, index)
 		}
 	}
 
+	// [4] Append any new entries not already in the log
+	for index := (prevLogIndex + 1); index <= indexRange; index++ {
+		if rf.log[index].Term == 0 {
+			rf.log[index] = args.Entries[index]
+			Debug(dLog, "S%d Follower, Logging new entry! "+
+				"Index=%d Term=%d Cmd=%d logSize=%d",
+				rf.me, index,
+				args.Entries[index].Term, args.Entries[index].Command, len(rf.log))
+		}
+	}
+	// }
+
+	// [5] If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if leadersCommit > rf.commitIndex {
+		rf.commitIndex = min(leadersCommit, len(rf.log))
+	}
+
+	// If commitIndex > lastApplied: increment lastApplied, apply
+	// log[lastApplied] to state machine
+	for rf.commitIndex > rf.lastApplied {
+		rf.lastApplied++
+		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
+			rf.lastApplied, false, nil, 0, 0}
+		rf.applyCh <- msg
+		Debug(dCommit, "S%d Follower, Committing new entry on term%d, lastApplied:%d!"+
+			" Index: %d Term=%d Cmd=%d",
+			rf.me, args.Term, rf.lastApplied,
+			rf.lastApplied, rf.log[rf.lastApplied].Term,
+			rf.log[rf.lastApplied].Command)
+	}
+
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if leadersTerm > rf.currentTerm {
+		rf.currentTerm = leadersTerm
+		rf.currentState = Follower
+	}
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -635,7 +657,9 @@ func (rf *Raft) leaderHeartbeat() {
 			if i == rf.me { // Skip self
 				continue
 			}
-			go rf.AppendAndSync(i, len(rf.log), true) // Send RPC in parallel
+			// logIndex is the point where we sync
+			// for the heartbest, sync to the commitIndex
+			go rf.AppendAndSync(i, rf.commitIndex, true) // Send RPC in parallel
 		}
 	}
 
@@ -825,7 +849,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make(map[int]int)
 	// nextIndex initialized to leader last log + 1
 	for i := range rf.peers {
-		rf.nextIndex[i] = 1
+		rf.nextIndex[i] = len(rf.log) + 1
 	}
 
 	rf.matchindex = make(map[int]int)
