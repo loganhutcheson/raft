@@ -300,6 +300,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 	reply.Term = 0
 	reply.XLen = 0
 
+	// Loop over sending the AppendEntriesRPC
 	for !reply.Success {
 
 		// Acquire lock
@@ -382,22 +383,20 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
 		// Block on send
 		rf.sendAppendEntries(server, &args, &reply)
-
 	}
+
+	// Acquire lock
+	rf.mu.Lock()
 
 	// Successful commit by this raft
 	// Set nextIndex, so we know which is the next log to commit.
 	// Increment the matchIndex so we know we commited a new log.
-	rf.mu.Lock()
-	// TBD - what is stopping this from occuring on heartbeat?
-	if heartbeat {
-		Debug(dInfo, "S%d Leader - heartbeat", rf.me)
-	} else {
-		rf.nextIndex[server] = logIndex + 1
-		rf.matchindex[server] = logIndex
-		Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
-			rf.me, server, logIndex+1)
-	}
+	rf.nextIndex[server] = logIndex + 1
+	rf.matchindex[server] = logIndex
+	Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
+		rf.me, server, logIndex+1)
+
+	// Release lock
 	rf.mu.Unlock()
 
 	return true
@@ -416,63 +415,69 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-	term, isLeader = rf.GetState()
 
-	// If this is not a leader return false
-	if !isLeader {
-		return index, term, isLeader
-	}
-
+	// Acquire lock
 	rf.mu.Lock()
+	// Defer lock
 	defer rf.mu.Unlock()
 
-	// 1. Append the log to it's own (do not notify client success yet)
-	rf.log[len(rf.log)+1] = TermAndCommand{rf.currentTerm, command}
-	logIndex := len(rf.log)
+	// "Return false if not leader" -- see professor's note ;)
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return -1, term, isLeader
+	}
+
 	Debug(dLeader, "S%d Leader, Start() has been called for cmd: %d!",
 		rf.me, command)
 
-	// 2. Issue RPCs to each rafts in parallel
-	commitResult := make(chan bool)
+	// Append the new entry to the log
+	rf.log[len(rf.log)+1] = TermAndCommand{rf.currentTerm, command}
+	logIndex := len(rf.log)
 
+	// Issue RPCs in parallel
+	commitResult := make(chan bool)
 	for i := range rf.peers {
 		// Skip self
 		if i == rf.me {
 			continue
 		}
-		// Launch a separate thread for each peer
+		// Launch a separate thread for each raft
 		go func(peerIndex int) {
 			result := rf.AppendAndSync(peerIndex, logIndex, false)
+			// channel the results to commitResult
 			commitResult <- result
 		}(i)
 	}
 
-	// Start() returns after some time even if there
-	// is not a valid majority of servers present.
-	// It appears that the tester expects there to be a Start return
-	// and then a nCommitted after some tester sleep period to
-	// check that there is not a committment without a majority.
+	// Start() returns immediately
+	// however, this thread will wait to count the votes and commit
+	// with a majority of rafts adding the log
 	go func() {
-		append_count := 1 // start at 1 for leader
-		return_count := 1
+		// returnedCount counts the number of rafts that returned at ALL
+		returnedCount := 1
+		// appendedCount counts the number of rafts that returned True
+		// indicating that the log has been appended
+		appendedCount := 1
+
 		for result := range commitResult {
-			return_count++
+			returnedCount++
+			// If the return code was true
 			if result {
-				Debug(dLeader, "S%d Leader, got an approval for log %d to index %d!",
-					rf.me, command, logIndex)
-				append_count++
-				if append_count > (len(rf.peers) / 2) {
+				Debug(dLeader, "S%d Leader, got an approval",
+					" for log=%d index=%d!", rf.me, command, logIndex)
+
+				appendedCount++
+				// Check if a majority logs appended
+				if appendedCount > (len(rf.peers) / 2) {
+
+					// Acquire lock
 					rf.mu.Lock()
-					// Increment the commit index
-					// what if leader needs to commit multiple after approval?
-					// I.E. logIndex > commitIndex
-					for logIndex > rf.commitIndex {
-						rf.commitIndex++
-					}
-					// Apply log to state machine in-order
+					// Defer lock
+					defer rf.mu.Unlock()
+
+					// Set the commitIndex to logIndex
+					rf.commitIndex = logIndex
+					// Apply logs to state machine in-order
 					for rf.lastApplied < rf.commitIndex {
 						rf.lastApplied++
 						msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
@@ -483,7 +488,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term,
 							rf.log[rf.lastApplied].Command)
 					}
-					rf.mu.Unlock()
+
+					// Break out and return
 					break
 				}
 			} else {
@@ -491,16 +497,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.me, command)
 			}
 
-			if return_count > len(rf.peers) {
-				// Leader received ALL replies, but could not commit
+			// Return if we received replies from all rafts
+			// and still do not have a majority of raft's logging
+			// the new entry
+			if returnedCount >= len(rf.peers) {
 				return
 			}
-
 		}
 	}()
-	// Set the index to notify the tester that we think this log is
-	// *maybe* committed on the majority of servers.
-	return len(rf.log), term, isLeader
+
+	return logIndex, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -592,9 +598,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if mismatch {
 		for index := mismatchIndex; mismatchIndex <= len(rf.log); index++ {
 			Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
-				" Follower's Term=%d Cmd=%d Leader's Term=%d Cmd=%d",
-				rf.me, index, rf.log[index].Term, rf.log[index].Command,
-				args.Entries[index].Term, args.Entries[index].Command)
+				" Term=%d Cmd=%d",
+				rf.me, index, rf.log[index].Term, rf.log[index].Command)
 			delete(rf.log, index)
 		}
 	}
@@ -609,7 +614,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				args.Entries[index].Term, args.Entries[index].Command, len(rf.log))
 		}
 	}
-	// }
 
 	// [5] If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
