@@ -314,6 +314,9 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 			return false
 		}
 
+		// Reset newEntries
+		newEntries = make(map[int]TermAndCommand)
+
 		// If the failure is because of follower on
 		// higher term, then we don't try to fix consistency
 		// revert back to follower
@@ -430,7 +433,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	Debug(dLeader, "S%d Leader, Start() has been called for cmd: %d!",
 		rf.me, command)
 
-	// Append the new entry to the log
+	// Append the new entry to the leader's log
 	rf.log[len(rf.log)+1] = TermAndCommand{rf.currentTerm, command}
 	logIndex := len(rf.log)
 
@@ -443,8 +446,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		// Launch a separate thread for each raft
 		go func(peerIndex int) {
+			// AppendAndSync could take a while and may never return to this channel
 			result := rf.AppendAndSync(peerIndex, logIndex, false)
-			// channel the results to commitResult
+			// Send the results to commitResult channel
+			// *the thread started below*
 			commitResult <- result
 		}(i)
 	}
@@ -459,12 +464,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// indicating that the log has been appended
 		appendedCount := 1
 
+		// Iterate over the commitResult channel
+		// In Go, this blocks until we receive a result from a separate thread
 		for result := range commitResult {
+
+			// "Return false if not leader" -- see professor's note ;)
+			_, isLeader := rf.GetState()
+			if !isLeader {
+				return
+			}
+
 			returnedCount++
 			// If the return code was true
 			if result {
-				Debug(dLeader, "S%d Leader, got an approval",
-					" for log=%d index=%d!", rf.me, command, logIndex)
+				Debug(dLeader, "S%d Leader, got an approval"+
+					" Index=%d Term=%d Cmd=%d!",
+					rf.me, logIndex, rf.currentTerm, command)
 
 				appendedCount++
 				// Check if a majority logs appended
@@ -472,8 +487,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 					// Acquire lock
 					rf.mu.Lock()
-					// Defer lock
-					defer rf.mu.Unlock()
 
 					// Set the commitIndex to logIndex
 					rf.commitIndex = logIndex
@@ -488,6 +501,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term,
 							rf.log[rf.lastApplied].Command)
 					}
+
+					// Release lock
+					rf.mu.Unlock()
 
 					// Break out and return
 					break
@@ -539,6 +555,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	leadersCommit := args.LeaderCommit
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
+
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if leadersTerm > rf.currentTerm {
+		rf.currentTerm = leadersTerm
+		rf.currentState = Follower
+	}
 
 	// [1] Reply false if term < currentTerm
 	if leadersTerm < rf.currentTerm {
@@ -635,12 +658,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log[rf.lastApplied].Command)
 	}
 
-	// If RPC request or response contains term T > currentTerm:
-	// set currentTerm = T, convert to follower (§5.1)
-	if leadersTerm > rf.currentTerm {
-		rf.currentTerm = leadersTerm
-		rf.currentState = Follower
-	}
 	reply.Success = true
 }
 
