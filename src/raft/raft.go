@@ -364,8 +364,8 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
 		// Add all the missing entries between nextIndex and logIndex
 		if rf.nextIndex[server] <= logIndex {
-			Debug(dInfo, "S%d sending entries between %d <-> %d to S%d",
-				rf.me, rf.nextIndex[server], logIndex, server)
+			//Debug(dInfo, "S%d sending entries between %d <-> %d to S%d",
+			//	rf.me, rf.nextIndex[server], logIndex, server)
 			for i := rf.nextIndex[server]; i <= logIndex; i++ {
 				newEntries[i] = rf.log[i]
 			}
@@ -631,7 +631,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if mismatch {
-		for index := mismatchIndex; index <= len(rf.log); index++ {
+		// Save the original log length as we will be deleting entries
+		logLength := len(rf.log)
+		for index := mismatchIndex; index <= logLength; index++ {
 			Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
 				" Term=%d Cmd=%d",
 				rf.me, index, rf.log[index].Term, rf.log[index].Command)
