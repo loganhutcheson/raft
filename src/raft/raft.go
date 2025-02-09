@@ -293,7 +293,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // also handles the back up procedure upon rejection
 func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
-	newEntries := make(map[int]TermAndCommand)
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 	reply.Success = false
@@ -315,7 +314,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 		}
 
 		// Reset newEntries
-		newEntries = make(map[int]TermAndCommand)
+		newEntries := make(map[int]TermAndCommand)
 
 		// If the failure is because of follower on
 		// higher term, then we don't try to fix consistency
@@ -386,6 +385,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
 		// Block on send
 		rf.sendAppendEntries(server, &args, &reply)
+
 	}
 
 	// Acquire lock
@@ -394,10 +394,15 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 	// Successful commit by this raft
 	// Set nextIndex, so we know which is the next log to commit.
 	// Increment the matchIndex so we know we commited a new log.
-	rf.nextIndex[server] = logIndex + 1
-	rf.matchindex[server] = logIndex
-	Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
-		rf.me, server, logIndex+1)
+
+	// Guard against a concurrent start that has already added
+	// a larger set of these entries.
+	if rf.nextIndex[server] < logIndex+1 {
+		rf.nextIndex[server] = logIndex + 1
+		rf.matchindex[server] = logIndex
+		Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (success case)",
+			rf.me, server, logIndex+1)
+	}
 
 	// Release lock
 	rf.mu.Unlock()
@@ -482,14 +487,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.me, logIndex, rf.currentTerm, command)
 
 				appendedCount++
-				// Check if a majority logs appended
-				if appendedCount > (len(rf.peers) / 2) {
+				// Check if a majority logs appended (n/2+1)
+				if appendedCount == (len(rf.peers)/2)+1 {
 
 					// Acquire lock
 					rf.mu.Lock()
 
-					// Set the commitIndex to logIndex
-					rf.commitIndex = logIndex
+					// Guard against a concurrent start that has already added
+					// a larger set of these entries.
+					if rf.commitIndex < logIndex {
+						rf.commitIndex = logIndex
+					}
 					// Apply logs to state machine in-order
 					for rf.lastApplied < rf.commitIndex {
 						rf.lastApplied++
@@ -515,7 +523,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 			// Return if we received replies from all rafts
 			// and still do not have a majority of raft's logging
-			// the new entry
+			// the new entry, or we reached majority
 			if returnedCount >= len(rf.peers) {
 				return
 			}
@@ -551,6 +559,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// TODO - remove
+	// Debug(dCommit, "S%d Follower, received AppendEntries %d %d %d", rf.me, args.LeaderCommit, len(rf.log), rf.lastApplied)
+
 	leadersTerm := args.Term
 	leadersCommit := args.LeaderCommit
 	prevLogIndex := args.PrevLogIndex
@@ -573,6 +584,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// [2] Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
 	if rf.log[prevLogIndex].Term != prevLogTerm {
+		Debug(dDrop, "S%d Follower, fast backup on index %d", rf.me, prevLogIndex)
 		reply.Success = false
 		// Fast Backup
 		if rf.log[prevLogIndex].Term != 0 {
@@ -619,7 +631,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if mismatch {
-		for index := mismatchIndex; mismatchIndex <= len(rf.log); index++ {
+		for index := mismatchIndex; index <= len(rf.log); index++ {
 			Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
 				" Term=%d Cmd=%d",
 				rf.me, index, rf.log[index].Term, rf.log[index].Command)
@@ -651,9 +663,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		msg := ApplyMsg{true, rf.log[rf.lastApplied].Command,
 			rf.lastApplied, false, nil, 0, 0}
 		rf.applyCh <- msg
-		Debug(dCommit, "S%d Follower, Committing new entry on term%d, lastApplied:%d!"+
+		Debug(dCommit, "S%d Follower, Committing new entry on term%d, commitIndex:%d, lastApplied:%d!"+
 			" Index: %d Term=%d Cmd=%d",
-			rf.me, args.Term, rf.lastApplied,
+			rf.me, args.Term, rf.commitIndex, rf.lastApplied,
 			rf.lastApplied, rf.log[rf.lastApplied].Term,
 			rf.log[rf.lastApplied].Command)
 	}
