@@ -371,7 +371,15 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 			}
 		}
 
-		prevLogIndex := rf.nextIndex[server] - 1
+		// prevLogIndex is the index immediately proceeding
+		// any new entries. If there are no new entries, send
+		// the commitIndex
+		prevLogIndex := 0
+		if len(newEntries) == 0 {
+			prevLogIndex = rf.commitIndex
+		} else {
+			prevLogIndex = rf.nextIndex[server] - 1
+		}
 		prevLogTerm := rf.log[prevLogIndex].Term
 
 		// Reset Reply to avoid labgob decode error
@@ -666,10 +674,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.lastApplied, false, nil, 0, 0}
 		rf.applyCh <- msg
 		Debug(dCommit, "S%d Follower, Committing new entry on term%d, commitIndex:%d, lastApplied:%d!"+
-			" Index: %d Term=%d Cmd=%d",
+			" Index: %d Term=%d Cmd=%d prevLogIndex=%d prevLogTerm=%d ",
 			rf.me, args.Term, rf.commitIndex, rf.lastApplied,
 			rf.lastApplied, rf.log[rf.lastApplied].Term,
-			rf.log[rf.lastApplied].Command)
+			rf.log[rf.lastApplied].Command, prevLogIndex, prevLogTerm)
 	}
 
 	reply.Success = true
@@ -680,11 +688,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// leaderHeartbeat starts the heartbeat process for a leader Raft instance.
+// startLeaderHeartbeat starts the heartbeat process for a leader Raft instance.
 // Sends a heartbeat (AppendEntries) RPC to all peers at a regular interval.
-func (rf *Raft) leaderHeartbeat() {
+func (rf *Raft) startLeaderHeartbeat() {
 	Debug(dLeader, "S%d Leader, starting heartbeat", rf.me)
 	rf.leaderId = rand.Int63()
+
+	// Initialize next Index
+	for i := range rf.peers {
+		if i == rf.me { // Skip self
+			continue
+		}
+		rf.nextIndex[i] = len(rf.log) + 1
+	}
 
 	// Helper function to send heartbeats
 	sendHeartbeats := func() {
@@ -837,7 +853,7 @@ func (rf *Raft) electionTicker() {
 				}
 
 				// Start the leader routine
-				go rf.leaderHeartbeat()
+				go rf.startLeaderHeartbeat()
 			} else {
 				// Lost the election
 				Debug(dVote, "S%d Candidate, lost the election!", rf.me)
