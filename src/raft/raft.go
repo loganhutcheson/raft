@@ -364,8 +364,8 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 
 		// Add all the missing entries between nextIndex and logIndex
 		if rf.nextIndex[server] <= logIndex {
-			//Debug(dInfo, "S%d sending entries between %d <-> %d to S%d",
-			//	rf.me, rf.nextIndex[server], logIndex, server)
+			Debug(dInfo, "S%d sending entries between %d <-> %d to S%d",
+				rf.me, rf.nextIndex[server], logIndex, server)
 			for i := rf.nextIndex[server]; i <= logIndex; i++ {
 				newEntries[i] = rf.log[i]
 			}
@@ -609,6 +609,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			reply.XIndex = index + 1
 			reply.XLen = len(rf.log)
+			// Follow
 			return
 		} else {
 			// Follower has no entry at PrevLogIndex
@@ -638,6 +639,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
+
 	if mismatch {
 		// Save the original log length as we will be deleting entries
 		logLength := len(rf.log)
@@ -650,6 +652,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// [4] Append any new entries not already in the log
+	// and delete any stale logs after the appended logs (append only)
 	for index := (prevLogIndex + 1); index <= indexRange; index++ {
 		if rf.log[index].Term == 0 {
 			rf.log[index] = args.Entries[index]
@@ -660,10 +663,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	// Logan - there is a problem here. If there is an index 52 and the leader sends 1-52 with commitIndex > 52,
+	// then we can commit a stale 52.
+	// The problem was my initial understanding of "last new entry"
+	// that is not the follower's log which can contain stale entries.
+	// Rather, it is the lew entries being sent by the leader. Which
+	// are guaranteed to be correct.
+
 	// [5] If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
 	if leadersCommit > rf.commitIndex {
-		rf.commitIndex = min(leadersCommit, len(rf.log))
+		rf.commitIndex = min(leadersCommit, indexRange)
 	}
 
 	// If commitIndex > lastApplied: increment lastApplied, apply
