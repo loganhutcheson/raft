@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -116,14 +118,23 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	// Persist the following:
+	// currentTerm
+	// votedFor
+	// log[]
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+
+	size := rf.persister.RaftStateSize()
+
+	Debug(dPersist, "S%d persist(), size=%d", rf.me, size)
+
 }
 
 // restore previously persisted state.
@@ -131,19 +142,24 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var log map[int]TermAndCommand
+	var votedFor int64
+	var currentTerm int
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		Debug(dError, "S%d Error decoding persisted state", rf.me)
+	} else {
+		rf.log = log
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+		Debug(dPersist, "S%d reboot. Found log of length %d", rf.me, len(rf.log))
+	}
+
 }
 
 // the service says it has created a snapshot that has
@@ -203,7 +219,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Variables
 	currentTerm := rf.currentTerm
-	lastLoggedTerm := rf.log[rf.commitIndex].Term
+	// Logan - I am using the "commitIndex" here, but this is not
+	// the most "up-to-date"
+	lastLoggedTerm := rf.log[len(rf.log)].Term
 	votedFor := rf.votedFor
 	logLength := len(rf.log)
 	candidateTerm := args.CandidateTerm
@@ -220,6 +238,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if candidateTerm > currentTerm {
 		rf.currentState = Follower     // Set this raft's state to Follower
 		rf.currentTerm = candidateTerm // Sync terms
+		// Set currentTerm Persist()
+		rf.persist()
 	}
 
 	// Case[1]: candidate has a lower term
@@ -250,6 +270,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(candidateLastLoggedTerm == lastLoggedTerm && candidateLogLength >= logLength) {
 			reply.VoteGranted = true  // Accept candidate
 			rf.votedFor = candidateId // Set votedFor to this candidate
+			// Set votedFor, persist()
+			rf.persist()
 			Debug(dVote, "S%d Follower, granting vote to %d same/greater term %d.", rf.me,
 				args.CandidateId, args.CandidateTerm)
 		}
@@ -357,9 +379,18 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
 					// first index of the missing term
 					Debug(dInfo, "S%d Leader - setting nextIndex for S%d to %d (case 3)",
 						rf.me, server, reply.XIndex)
+
+					// Logan note - how do we back-up even more in this case
+					// if we continue to get the same len(rf.log) from the follower
+					// and all the entries in the follower's log are from some different
+					// term.
 					rf.nextIndex[server] = reply.XIndex
 				}
 			}
+		} else {
+			// Monotonically backup still supported for case where we can't backup anymore
+			// and the follower still has messy logs
+			// rf.nextIndex[server]--
 		}
 
 		// Add all the missing entries between nextIndex and logIndex
@@ -516,6 +547,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							"Index:%d Term=%d Cmd=%d",
 							rf.me, rf.lastApplied, rf.log[rf.lastApplied].Term,
 							rf.log[rf.lastApplied].Command)
+						// committed, persist()
+						rf.persist()
 					}
 
 					// Release lock
@@ -579,6 +612,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// set currentTerm = T, convert to follower (§5.1)
 	if leadersTerm > rf.currentTerm {
 		rf.currentTerm = leadersTerm
+		// Set currentTerm Persist()
+		rf.persist()
 		rf.currentState = Follower
 	}
 
@@ -600,6 +635,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = rf.log[args.PrevLogIndex].Term
 			// Find the first index of XTerm in the follower's log
 			index := args.PrevLogIndex
+			// Logan Note - there is a bug here, because if
+			// we may never back up to beyond some incorrect logs
+			// that are from some other term.
+			// it's probably the leader that needs to do the
+			// monotonic decrement no matter what to handle
+			// this case.
 			for rf.log[index].Term == reply.XTerm {
 				if index > 0 {
 					index--
@@ -616,6 +657,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = -1
 			reply.XLen = len(rf.log)
+
+			// Logan let's try to fix the backup issue by sending zero and let the leader know
+			// to monotonically back-pedal. It also could be worth just backing the entire
+			// way up at this point, however, that could be dangerous as logs get much larger in scale and
+			// with snapshotting.
+			//if args.PrevLogIndex <= reply.XLen {
+			//	reply.XLen = 0
+			//}
 		}
 		return
 	}
@@ -645,8 +694,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		logLength := len(rf.log)
 		for index := mismatchIndex; index <= logLength; index++ {
 			Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
-				" Term=%d Cmd=%d",
-				rf.me, index, rf.log[index].Term, rf.log[index].Command)
+				" Term=%d Cmd=%d Leader has Term=%d",
+				rf.me, index, rf.log[index].Term, rf.log[index].Command, args.Entries[index].Term)
 			delete(rf.log, index)
 		}
 	}
@@ -662,13 +711,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				args.Entries[index].Term, args.Entries[index].Command, len(rf.log))
 		}
 	}
-
-	// Logan - there is a problem here. If there is an index 52 and the leader sends 1-52 with commitIndex > 52,
-	// then we can commit a stale 52.
-	// The problem was my initial understanding of "last new entry"
-	// that is not the follower's log which can contain stale entries.
-	// Rather, it is the lew entries being sent by the leader. Which
-	// are guaranteed to be correct.
 
 	// [5] If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -688,6 +730,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.me, args.Term, rf.commitIndex, rf.lastApplied,
 			rf.lastApplied, rf.log[rf.lastApplied].Term,
 			rf.log[rf.lastApplied].Command, prevLogIndex, prevLogTerm)
+		// Committed, persist()
+		rf.persist()
 	}
 
 	reply.Success = true
@@ -783,6 +827,8 @@ func (rf *Raft) electionTicker() {
 			rf.votedFor = candidateId   // Vote for self
 			votes := 1                  // Vote for self
 			rf.currentTerm++            // Increment the term
+			// Set currentTerm Persist()
+			rf.persist()
 			Debug(dVote, "S%d Follower, starting election id=%d, term=%d",
 				rf.me, candidateId, rf.currentTerm)
 
@@ -892,7 +938,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
 	rf.applyCh = applyCh
 
 	// Persistent state
