@@ -624,10 +624,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		rf.heartBeatReceived = true
 	}
+
+	// Default fast backup
+	reply.XIndex = -1
+	reply.XLen = -1
+	reply.XTerm = -1
+
 	// [2] Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
 	if rf.log[prevLogIndex].Term != prevLogTerm {
-		Debug(dDrop, "S%d Follower, fast backup on index %d", rf.me, prevLogIndex)
+		Debug(dDrop, "S%d Follower, fast backup on index %d, loglen %d", rf.me, prevLogIndex, len(rf.log))
 		reply.Success = false
 		// Fast Backup
 		if rf.log[prevLogIndex].Term != 0 {
@@ -649,14 +655,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 			}
 			reply.XIndex = index + 1
-			reply.XLen = len(rf.log)
-			// Follow
+			reply.XLen = max(len(rf.log), 1)
 			return
 		} else {
 			// Follower has no entry at PrevLogIndex
 			reply.XTerm = -1
 			reply.XIndex = -1
-			reply.XLen = len(rf.log)
+			reply.XLen = max(len(rf.log), 1)
 
 			// Logan let's try to fix the backup issue by sending zero and let the leader know
 			// to monotonically back-pedal. It also could be worth just backing the entire
