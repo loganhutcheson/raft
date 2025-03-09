@@ -133,7 +133,7 @@ func (rf *Raft) persist() {
 
 	size := rf.persister.RaftStateSize()
 
-	Debug(dPersist, "S%d persist(), size=%d", rf.me, size)
+	Debug(dPersist, "S%d persist(), size=%d, loglength=%d", rf.me, size, len(rf.log))
 
 }
 
@@ -662,14 +662,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = -1
 			reply.XIndex = -1
 			reply.XLen = max(len(rf.log), 1)
-
-			// Logan let's try to fix the backup issue by sending zero and let the leader know
-			// to monotonically back-pedal. It also could be worth just backing the entire
-			// way up at this point, however, that could be dangerous as logs get much larger in scale and
-			// with snapshotting.
-			//if args.PrevLogIndex <= reply.XLen {
-			//	reply.XLen = 0
-			//}
 		}
 		return
 	}
@@ -702,6 +694,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				" Term=%d Cmd=%d Leader has Term=%d",
 				rf.me, index, rf.log[index].Term, rf.log[index].Command, args.Entries[index].Term)
 			delete(rf.log, index)
+			// Log modified, persist()
+			rf.persist()
 		}
 	}
 
@@ -714,6 +708,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				"Index=%d Term=%d Cmd=%d logSize=%d",
 				rf.me, index,
 				args.Entries[index].Term, args.Entries[index].Command, len(rf.log))
+			// Log modified, persist()
+			rf.persist()
 		}
 	}
 
@@ -970,6 +966,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start electionTicker goroutine to start elections
 	go rf.electionTicker()
+
+	// Log that we started (or restarted)
+	Debug(dInfo, "S%d, restarted", rf.me)
 
 	return rf
 }
