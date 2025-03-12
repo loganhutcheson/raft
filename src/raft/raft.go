@@ -133,12 +133,15 @@ func (rf *Raft) persist() {
 
 	size := rf.persister.RaftStateSize()
 
-	Debug(dPersist, "S%d persist(), size=%d, loglength=%d", rf.me, size, len(rf.log))
+	Debug(dPersist, "S%d persist(), size=%d "+
+		"currentTerm%d loglength=%d votedFor=%d", rf.me, size,
+		rf.currentTerm, len(rf.log), rf.votedFor)
 
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -313,19 +316,30 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // A launched thread the endlessly tries to commit
 // a log to a specified raft index
 // also handles the back up procedure upon rejection
-func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool) bool {
+func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool, currentTerm int) bool {
 
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 	reply.Success = false
 	reply.Term = 0
 	reply.XLen = 0
+	originalTerm := rf.currentTerm
 
 	// Loop over sending the AppendEntriesRPC
 	for !reply.Success {
 
 		// Acquire lock
 		rf.mu.Lock()
+
+		// This is an error case, that would only occur
+		// for extremely delayed messages
+		// (i'll call this the leader hop)
+		if originalTerm != rf.currentTerm || rf.currentTerm == 0 {
+			Debug(dError, "S%d LOGANERROR - uh oh :-0", rf.me)
+			// Release Lock
+			rf.mu.Unlock()
+			return false
+		}
 
 		// Check if we are still leader
 		_, isLeader := rf.GetState()
@@ -479,6 +493,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Append the new entry to the leader's log
 	rf.log[len(rf.log)+1] = TermAndCommand{rf.currentTerm, command}
+	// Log modified, persist()
+	rf.persist()
+
 	logIndex := len(rf.log)
 
 	// Issue RPCs in parallel
@@ -491,7 +508,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// Launch a separate thread for each raft
 		go func(peerIndex int) {
 			// AppendAndSync could take a while and may never return to this channel
-			result := rf.AppendAndSync(peerIndex, logIndex, false)
+			result := rf.AppendAndSync(peerIndex, logIndex, false, rf.currentTerm)
 			// Send the results to commitResult channel
 			// *the thread started below*
 			commitResult <- result
@@ -625,6 +642,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.heartBeatReceived = true
 	}
 
+	// Logan note
+	// Could it be possible that this thread is looping
+	// and we lose leader and become leader again
+	// resulting in some wrong logs being sent
+	// as if from a leader?
+	// Let's check here if the term has changed
+	//if currentTerm != rf.currentTerm {
+	//Debug(dError, "S%d Leader - LOGANERROR, not the same leader", rf.me)
+	//	return false
+	//}
+	if leadersTerm > rf.currentTerm {
+		// this clearly is not correct as well hmmf
+		Debug(dError, "S%d Leader - LOGANERROR, not the same leader", rf.me)
+		// Logan note - we may need to handle this case just because some pre-existing
+		// raft system was running and we need to filter those delayed RPCs out
+		// that would be a shame though.
+
+	}
+
 	// Default fast backup
 	reply.XIndex = -1
 	reply.XLen = -1
@@ -702,6 +738,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// [4] Append any new entries not already in the log
 	// and delete any stale logs after the appended logs (append only)
 	for index := (prevLogIndex + 1); index <= indexRange; index++ {
+		// Logan note if term is zero
+		// then it appears we may iterate of two RPC
+		// that contains nil entries and add them. (symptom of bug)
 		if rf.log[index].Term == 0 {
 			rf.log[index] = args.Entries[index]
 			Debug(dLog, "S%d Follower, Logging new entry! "+
@@ -765,7 +804,7 @@ func (rf *Raft) startLeaderHeartbeat() {
 			}
 			// logIndex is the point where we sync
 			// for the heartbest, sync to the commitIndex
-			go rf.AppendAndSync(i, rf.commitIndex, true) // Send RPC in parallel
+			go rf.AppendAndSync(i, rf.commitIndex, true, rf.currentTerm) // Send RPC in parallel
 		}
 	}
 
