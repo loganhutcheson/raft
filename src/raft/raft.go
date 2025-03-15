@@ -331,6 +331,7 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool, currentT
 		// Acquire lock
 		rf.mu.Lock()
 
+		start := time.Now()
 		// This is an error case, that would only occur
 		// for extremely delayed messages
 		// (i'll call this the leader hop)
@@ -438,6 +439,11 @@ func (rf *Raft) AppendAndSync(server int, logIndex int, heartbeat bool, currentT
 
 		// Block on send
 		rf.sendAppendEntries(server, &args, &reply)
+
+		elapsed := time.Since(start)
+		if elapsed < 10*time.Millisecond {
+			time.Sleep(10*time.Millisecond - elapsed)
+		}
 
 	}
 
