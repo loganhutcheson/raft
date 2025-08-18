@@ -12,7 +12,7 @@ import (
 )
 
 // Globals timeouts (ms)
-var electionTimeout int64 = 500
+var electionTimeout int64 = 1000
 
 const HeartbeatTimeout = 100 * time.Millisecond
 
@@ -47,7 +47,7 @@ const (
 
 // Define a struct to hold the integer and interface{}
 // This is used in the uncommitted log for the Index and the Command
-type TermAndCommand struct {
+type LogEntry struct {
 	Term    int
 	Command interface{}
 }
@@ -66,7 +66,7 @@ type Raft struct {
 	// Persistent state
 	currentTerm int
 	votedFor    int64
-	log         map[int]TermAndCommand
+	log         []LogEntry
 
 	// Volatile state
 	currentState      RaftState
@@ -78,7 +78,10 @@ type Raft struct {
 	matchindex        map[int]int
 	lastLogIndex      int // Track the highest log index
 
-	// TODO: Add snapshot fields when implementing 3D
+	// 3D Snapshot
+	snapshotIndex int
+	snapshotTerm  int
+	snapshot      []byte
 }
 
 // return currentTerm and whether this server
@@ -129,7 +132,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var log map[int]TermAndCommand
+	var log []LogEntry
 	var votedFor int64
 	var currentTerm int
 	var lastLogIndex int
@@ -146,12 +149,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.lastLogIndex = lastLogIndex
 
 		// Validate lastLogIndex against actual log entries
-		actualLastIndex := 0
-		for index := range rf.log {
-			if index > actualLastIndex {
-				actualLastIndex = index
-			}
-		}
+		actualLastIndex := len(rf.log) - 1
 		if actualLastIndex != rf.lastLogIndex {
 			Debug(dPersist, "S%d Correcting lastLogIndex from %d to %d", rf.me, rf.lastLogIndex, actualLastIndex)
 			rf.lastLogIndex = actualLastIndex
@@ -200,7 +198,7 @@ type AppendEntriesArgs struct {
 	// 3B
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      map[int]TermAndCommand
+	Entries      []LogEntry
 	LeaderCommit int
 }
 
@@ -226,10 +224,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Variables
 	currentTerm := rf.currentTerm
 	lastLoggedTerm := 0
-	if rf.lastLogIndex > 0 {
-		if entry, exists := rf.log[rf.lastLogIndex]; exists {
-			lastLoggedTerm = entry.Term
-		}
+	if rf.lastLogIndex > 0 && rf.lastLogIndex < len(rf.log) {
+		lastLoggedTerm = rf.log[rf.lastLogIndex].Term
 	}
 	votedFor := rf.votedFor
 	logLength := rf.lastLogIndex
@@ -319,20 +315,17 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 	// Determine what entries to send
 	prevLogIndex := rf.nextIndex[server] - 1
 	prevLogTerm := 0
-	if prevLogIndex >= 0 {
-		if entry, exists := rf.log[prevLogIndex]; exists {
-			prevLogTerm = entry.Term
-		}
+	if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+		prevLogTerm = rf.log[prevLogIndex].Term
 	}
 
 	// Prepare entries to send
-	entries := make(map[int]TermAndCommand)
+	var entries []LogEntry
 	if !isHeartbeat {
 		// Send all entries from nextIndex to end of log
-		for i := rf.nextIndex[server]; i <= rf.lastLogIndex; i++ {
-			if entry, exists := rf.log[i]; exists {
-				entries[i] = entry
-			}
+		startIndex := rf.nextIndex[server]
+		if startIndex < len(rf.log) {
+			entries = rf.log[startIndex:]
 		}
 	}
 
@@ -352,11 +345,8 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 	ok := rf.sendAppendEntries(server, args, reply)
 
 	if !ok {
-		// Retry RPC failures to ensure log synchronization
-		go func() {
-			time.Sleep(50 * time.Millisecond) // Longer delay for RPC failures
-			rf.sendAppendEntriesToPeer(server, isHeartbeat)
-		}()
+		// RPC failed, but don't retry here to avoid infinite recursion
+		// The heartbeat loop will retry automatically
 		return false
 	}
 
@@ -380,13 +370,8 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 	if reply.Success {
 		// Update nextIndex and matchIndex
 		if len(entries) > 0 {
-			// Find the highest index we sent
-			highestSentIndex := 0
-			for index := range entries {
-				if index > highestSentIndex {
-					highestSentIndex = index
-				}
-			}
+			// Calculate the highest index we sent
+			highestSentIndex := prevLogIndex + len(entries)
 			rf.nextIndex[server] = highestSentIndex + 1
 			rf.matchindex[server] = highestSentIndex
 		}
@@ -403,8 +388,8 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 			} else {
 				// Find the first index of XTerm in leader's log
 				found := -1
-				for i := 1; i <= rf.lastLogIndex; i++ {
-					if entry, exists := rf.log[i]; exists && entry.Term == reply.XTerm {
+				for i := 1; i <= rf.lastLogIndex && i < len(rf.log); i++ {
+					if rf.log[i].Term == reply.XTerm {
 						found = i
 						break
 					}
@@ -429,7 +414,7 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 // tryCommitEntries attempts to commit new entries based on matchIndex
 func (rf *Raft) tryCommitEntries() {
 	for n := rf.commitIndex + 1; n <= rf.lastLogIndex; n++ {
-		if entry, exists := rf.log[n]; exists && entry.Term > 0 {
+		if n < len(rf.log) && rf.log[n].Term > 0 {
 			count := 1 // Count self
 			for peer := range rf.peers {
 				if peer != rf.me && rf.matchindex[peer] >= n {
@@ -447,7 +432,8 @@ func (rf *Raft) tryCommitEntries() {
 	// Apply committed entries
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
-		if entry, exists := rf.log[rf.lastApplied]; exists {
+		if rf.lastApplied < len(rf.log) {
+			entry := rf.log[rf.lastApplied]
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
@@ -486,7 +472,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Append the new entry to the leader's log
 	rf.lastLogIndex++
-	rf.log[rf.lastLogIndex] = TermAndCommand{rf.currentTerm, command}
+	// Ensure log is large enough
+	for len(rf.log) <= rf.lastLogIndex {
+		rf.log = append(rf.log, LogEntry{})
+	}
+	rf.log[rf.lastLogIndex] = LogEntry{rf.currentTerm, command}
 	rf.persist()
 
 	logIndex := rf.lastLogIndex
@@ -502,19 +492,29 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				continue
 			}
 			go func(peerIndex int) {
-				success := rf.sendAppendEntriesToPeer(peerIndex, false)
-				commitChan <- success
+				if !rf.killed() {
+					success := rf.sendAppendEntriesToPeer(peerIndex, false)
+					commitChan <- success
+				} else {
+					commitChan <- false
+				}
 			}(i)
 		}
 
 		// Wait for responses and track commits
 		for i := 0; i < len(rf.peers)-1; i++ {
-			if <-commitChan {
-				commitCount++
-				if commitCount > len(rf.peers)/2 {
-					// Majority achieved, entry should be committed
-					break
+			select {
+			case success := <-commitChan:
+				if success {
+					commitCount++
+					if commitCount > len(rf.peers)/2 {
+						// Majority achieved, entry should be committed
+						break
+					}
 				}
+			case <-time.After(100 * time.Millisecond):
+				// Timeout to prevent hanging
+				break
 			}
 		}
 	}()
@@ -574,19 +574,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// [2] Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	if entry, exists := rf.log[prevLogIndex]; !exists || entry.Term != prevLogTerm {
+	if prevLogIndex >= len(rf.log) || rf.log[prevLogIndex].Term != prevLogTerm {
+		term := 0
+		if prevLogIndex < len(rf.log) {
+			term = rf.log[prevLogIndex].Term
+		}
 		Debug(dDrop, "S%d Follower, fast backup on index %d, loglen %d term=%d does not match leader's term=%d",
-			rf.me, prevLogIndex, len(rf.log), entry.Term, prevLogTerm)
+			rf.me, prevLogIndex, len(rf.log), term, prevLogTerm)
 		reply.Success = false
 		// Fast Backup
-		if exists && entry.Term != 0 {
+		if prevLogIndex < len(rf.log) && rf.log[prevLogIndex].Term != 0 {
 			// Follower has a conflicting Xterm at PrevLogIndex
-			reply.XTerm = entry.Term
+			reply.XTerm = rf.log[prevLogIndex].Term
 
 			// Find the first index of XTerm in the follower's log
 			index := args.PrevLogIndex
 			for {
-				if indexEntry, indexExists := rf.log[index]; indexExists && indexEntry.Term == reply.XTerm {
+				if index < len(rf.log) && rf.log[index].Term == reply.XTerm {
 					if index > 0 {
 						index--
 					} else {
@@ -612,50 +616,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	indexRange := prevLogIndex + len(args.Entries)
 	mismatch := false
 	mismatchIndex := 0
-	for index := (prevLogIndex + 1); index <= indexRange; index++ {
+	for i, argsEntry := range args.Entries {
+		index := prevLogIndex + 1 + i
 		// First check if the index exists in the follower's log
-		if followerEntry, exists := rf.log[index]; exists {
-			if argsEntry, argsExists := args.Entries[index]; argsExists && followerEntry.Term != argsEntry.Term {
-				mismatch = true
-				mismatchIndex = index
-				break
-			}
+		if index < len(rf.log) && rf.log[index].Term != argsEntry.Term {
+			mismatch = true
+			mismatchIndex = index
+			break
 		}
 	}
 
 	if mismatch {
-		// Delete conflicting entries and all that follow
-		for index := mismatchIndex; index <= rf.lastLogIndex; index++ {
-			if entry, exists := rf.log[index]; exists {
-				Debug(dDrop, "S%d Follower, dropping mismatch on Index=%d"+
-					" Term=%d Cmd=%d Leader has Term=%d",
-					rf.me, index, entry.Term, entry.Command, args.Entries[index].Term)
-				delete(rf.log, index)
-				rf.persist()
-			}
-		}
-		// Update lastLogIndex if we deleted entries
-		if mismatchIndex <= rf.lastLogIndex {
-			rf.lastLogIndex = mismatchIndex - 1
+		// Truncate log from mismatchIndex onwards
+		if mismatchIndex < len(rf.log) {
+			rf.log = rf.log[:mismatchIndex]
+			rf.lastLogIndex = max(0, mismatchIndex-1)
+			Debug(dDrop, "S%d Follower, truncating log at index %d", rf.me, mismatchIndex)
+			rf.persist()
 		}
 	}
 
 	// [4] Append any new entries not already in the log
-	for index := (prevLogIndex + 1); index <= indexRange; index++ {
-		if followerEntry, exists := rf.log[index]; !exists || followerEntry.Term == 0 {
-			if argsEntry, argsExists := args.Entries[index]; argsExists {
-				rf.log[index] = argsEntry
-				// Update lastLogIndex if this is a new entry
-				if index > rf.lastLogIndex {
-					rf.lastLogIndex = index
-				}
-				Debug(dLog, "S%d Follower, Logging new entry! "+
-					"Index=%d Term=%d Cmd=%d logSize=%d",
-					rf.me, index,
-					argsEntry.Term, argsEntry.Command, rf.lastLogIndex)
-				rf.persist()
-			}
+	for i, argsEntry := range args.Entries {
+		index := prevLogIndex + 1 + i
+		// Ensure log is large enough
+		for len(rf.log) <= index {
+			rf.log = append(rf.log, LogEntry{})
 		}
+		rf.log[index] = argsEntry
+		// Update lastLogIndex if this is a new entry
+		if index > rf.lastLogIndex {
+			rf.lastLogIndex = index
+		}
+		Debug(dLog, "S%d Follower, Logging new entry! "+
+			"Index=%d Term=%d Cmd=%d logSize=%d",
+			rf.me, index,
+			argsEntry.Term, argsEntry.Command, rf.lastLogIndex)
+		rf.persist()
 	}
 
 	// [5] If leaderCommit > commitIndex, set commitIndex =
@@ -668,7 +665,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// log[lastApplied] to state machine
 	for rf.commitIndex > rf.lastApplied {
 		rf.lastApplied++
-		if entry, exists := rf.log[rf.lastApplied]; exists {
+		if rf.lastApplied < len(rf.log) {
+			entry := rf.log[rf.lastApplied]
 			msg := ApplyMsg{true, entry.Command,
 				rf.lastApplied, false, nil, 0, 0}
 			rf.applyCh <- msg
@@ -773,10 +771,8 @@ func (rf *Raft) electionTicker() {
 
 			// Set term information for filtering election candidates
 			lastLoggedTerm := 0
-			if rf.lastLogIndex > 0 {
-				if entry, exists := rf.log[rf.lastLogIndex]; exists {
-					lastLoggedTerm = entry.Term
-				}
+			if rf.lastLogIndex > 0 && rf.lastLogIndex < len(rf.log) {
+				lastLoggedTerm = rf.log[rf.lastLogIndex].Term
 			}
 			args := RequestVoteArgs{candidateId, rf.currentTerm,
 				lastLoggedTerm, rf.lastLogIndex}
@@ -876,7 +872,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Persistent state
 	rf.currentTerm = 0
 	rf.votedFor = 0
-	rf.log = make(map[int]TermAndCommand)
+	rf.log = make([]LogEntry, 0) // Initialize as empty slice
 	rf.lastLogIndex = 0
 
 	// Volatile state
@@ -893,7 +889,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Add dummy entry at index 0 only if log is empty
 	if len(rf.log) == 0 {
-		rf.log[0] = TermAndCommand{Term: 0, Command: nil}
+		rf.log = append(rf.log, LogEntry{Term: 0, Command: nil})
 		rf.lastLogIndex = 0
 	}
 
