@@ -181,17 +181,20 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	// Validate index does not exceed last global log index
-	lastGlobalIndex := len(rf.log) - 1
+	lastGlobalIndex := rf.snapshotIndex + len(rf.log) - 1
 	if index > lastGlobalIndex {
 		Debug(dSnap, "S%d Snapshot ignored, index %d > last log index %d", rf.me, index, lastGlobalIndex)
 		return
 	}
 
-	// Get term at snapshot index
-	rf.snapshotTerm = rf.log[index].Term
+	// Convert global index to slice index
+	sliceIndex := index - rf.snapshotIndex
 
-	// Truncate log from index onwards
-	rf.log = rf.log[index+1:]
+	// Get term at snapshot index
+	rf.snapshotTerm = rf.log[sliceIndex].Term
+
+	// Truncate log from slice index onwards
+	rf.log = rf.log[sliceIndex+1:]
 
 	// Store snapshot data
 	rf.snapshot = snapshot
@@ -279,7 +282,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLoggedTerm = rf.log[len(rf.log)-1].Term
 	}
 	votedFor := rf.votedFor
-	logLength := len(rf.log)
+	logLength := rf.snapshotIndex + len(rf.log) // Convert to global index
 	candidateTerm := args.CandidateTerm
 	candidateId := args.CandidateId
 	candidateLastLoggedTerm := args.CandidateLastLoggedTerm
@@ -367,17 +370,30 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 	prevLogIndex := rf.nextIndex[server] - 1
 	prevLogTerm := 0
 
-	// Simple bounds checking
-	if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
-		prevLogTerm = rf.log[prevLogIndex].Term
+	// Handle term lookup for prevLogIndex
+	if prevLogIndex == rf.snapshotIndex {
+		// prevLogIndex is exactly at the snapshot boundary
+		prevLogTerm = rf.snapshotTerm
+	} else if prevLogIndex > rf.snapshotIndex {
+		// prevLogIndex is in our current log
+		prevLogSliceIndex := prevLogIndex - rf.snapshotIndex
+		if prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) {
+			prevLogTerm = rf.log[prevLogSliceIndex].Term
+		}
 	}
 
 	// Prepare entries to send
 	var entries []LogEntry
 	// Always send entries to catch up followers, even during heartbeats
-	startIndex := rf.nextIndex[server]
-	if startIndex >= 0 && startIndex < len(rf.log) {
-		entries = rf.log[startIndex:]
+	startSliceIndex := rf.nextIndex[server] - rf.snapshotIndex
+	if startSliceIndex >= 0 && startSliceIndex < len(rf.log) {
+		entries = rf.log[startSliceIndex:]
+	} else if startSliceIndex >= len(rf.log) {
+		// nextIndex is beyond our log, so no entries to send
+		entries = []LogEntry{}
+	} else if startSliceIndex < 0 {
+		// nextIndex is before our snapshot, this shouldn't happen but handle it
+		entries = []LogEntry{}
 	}
 
 	// If we have no entries to send and this is not a heartbeat, return
@@ -470,11 +486,13 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 
 // tryCommitEntries attempts to commit new entries based on matchIndex
 func (rf *Raft) tryCommitEntries() {
-	// Calculate the actual last log index
-	actualLastLogIndex := len(rf.log) - 1
+	// Calculate the actual last log index (global index)
+	actualLastLogIndex := rf.snapshotIndex + len(rf.log) - 1
 
 	for n := rf.commitIndex + 1; n <= actualLastLogIndex; n++ {
-		if n >= 0 && n < len(rf.log) && rf.log[n].Term > 0 {
+		// Convert global index to slice index
+		sliceIndex := n - rf.snapshotIndex
+		if sliceIndex >= 0 && sliceIndex < len(rf.log) && rf.log[sliceIndex].Term > 0 {
 			count := 1 // Count self
 			for peer := range rf.peers {
 				if peer != rf.me && rf.matchindex[peer] >= n {
@@ -491,17 +509,28 @@ func (rf *Raft) tryCommitEntries() {
 
 	// Apply committed entries
 	for rf.lastApplied < rf.commitIndex {
-		rf.lastApplied++
-		if rf.lastApplied >= 0 && rf.lastApplied < len(rf.log) {
-			entry := rf.log[rf.lastApplied]
+		// Convert global index to slice index
+		sliceIndex := (rf.lastApplied + 1) - rf.snapshotIndex
+		if sliceIndex >= 0 && sliceIndex < len(rf.log) {
+			entry := rf.log[sliceIndex]
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
-				CommandIndex: rf.lastApplied,
+				CommandIndex: rf.lastApplied + 1,
 			}
 			rf.applyCh <- msg
-			Debug(dCommit, "S%d Leader, Committing Entry! Index:%d Term=%d Cmd=%d",
-				rf.me, rf.lastApplied, entry.Term, entry.Command)
+			Debug(dCommit, "S%d Leader, Committing Entry! GlobalIndex:%d SliceIndex:%d Term=%d Cmd=%d",
+				rf.me, rf.lastApplied+1, sliceIndex, entry.Term, entry.Command)
+			rf.lastApplied++
+		} else if (rf.lastApplied + 1) <= rf.snapshotIndex {
+			// Entry is already in snapshot, no need to apply it again
+			rf.lastApplied++
+		} else {
+			// Entry should be in log but isn't - this is an error
+			Debug(dCommit, "S%d Leader, ERROR: Entry %d not found in log (sliceIndex=%d, logSize=%d)",
+				rf.me, rf.lastApplied+1, sliceIndex, len(rf.log))
+			// Skip this entry to avoid infinite loop
+			rf.lastApplied++
 		}
 	}
 }
@@ -631,21 +660,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// [2] Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
-	if prevLogIndex < 0 || prevLogIndex >= len(rf.log) || rf.log[prevLogIndex].Term != prevLogTerm {
+	// Convert global index to slice index
+	prevLogSliceIndex := prevLogIndex - rf.snapshotIndex
+	if prevLogIndex < rf.snapshotIndex || prevLogSliceIndex >= len(rf.log) ||
+		(prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) && rf.log[prevLogSliceIndex].Term != prevLogTerm) {
 		term := 0
-		if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
-			term = rf.log[prevLogIndex].Term
+		if prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) {
+			term = rf.log[prevLogSliceIndex].Term
 		}
-		Debug(dDrop, "S%d Follower, fast backup on index %d, loglen %d term=%d does not match leader's term=%d",
-			rf.me, prevLogIndex, len(rf.log), term, prevLogTerm)
+		Debug(dDrop, "S%d Follower, fast backup on global index %d (slice index %d), loglen %d term=%d does not match leader's term=%d",
+			rf.me, prevLogIndex, prevLogSliceIndex, len(rf.log), term, prevLogTerm)
 		reply.Success = false
 		// Fast Backup
-		if prevLogIndex >= 0 && prevLogIndex < len(rf.log) && rf.log[prevLogIndex].Term != 0 {
+		if prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) && rf.log[prevLogSliceIndex].Term != 0 {
 			// Follower has a conflicting Xterm at PrevLogIndex
-			reply.XTerm = rf.log[prevLogIndex].Term
+			reply.XTerm = rf.log[prevLogSliceIndex].Term
 
 			// Find the first index of XTerm in the follower's log
-			index := prevLogIndex
+			index := prevLogSliceIndex
 			for {
 				if index >= 0 && index < len(rf.log) && rf.log[index].Term == reply.XTerm {
 					if index > 0 {
@@ -657,22 +689,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					break
 				}
 			}
-			reply.XIndex = index
+			reply.XIndex = index + rf.snapshotIndex // Convert back to global index
 			// one past last index available at follower
-			reply.XLen = len(rf.log)
+			reply.XLen = rf.snapshotIndex + len(rf.log)
 			return
 		} else {
 			// Follower has no entry at PrevLogIndex
 			reply.XTerm = -1
 			reply.XIndex = -1
 			// one past last index available at follower
-			reply.XLen = len(rf.log)
+			reply.XLen = rf.snapshotIndex + len(rf.log)
 		}
 		return
 	}
 
 	// [3] Perform consistency check
-	indexRange := prevLogIndex + len(args.Entries)
 	mismatch := false
 	mismatchIndex := 0
 	for i, argsEntry := range args.Entries {
@@ -698,42 +729,59 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// [4] Append any new entries not already in the log
 	for i, argsEntry := range args.Entries {
-		index := prevLogIndex + 1 + i
+		globalIndex := prevLogIndex + 1 + i
+		// Convert global index to slice index
+		sliceIndex := globalIndex - rf.snapshotIndex
+
+		// Check if we already have this entry and it matches
+		if sliceIndex < len(rf.log) && rf.log[sliceIndex].Term == argsEntry.Term {
+			// Entry already exists and matches, skip it
+			Debug(dLog, "S%d Follower, skipping existing entry at GlobalIndex=%d SliceIndex=%d Term=%d Cmd=%d",
+				rf.me, globalIndex, sliceIndex, argsEntry.Term, argsEntry.Command)
+			continue
+		}
+
 		// Ensure log is large enough
-		for len(rf.log) <= index {
+		for len(rf.log) <= sliceIndex {
 			rf.log = append(rf.log, LogEntry{})
 		}
 		// Overwrite existing entry or add new one
-		rf.log[index] = argsEntry
+		rf.log[sliceIndex] = argsEntry
 		Debug(dLog, "S%d Follower, Logging new entry! "+
-			"Index=%d Term=%d Cmd=%d logSize=%d",
-			rf.me, index,
+			"GlobalIndex=%d SliceIndex=%d Term=%d Cmd=%d logSize=%d",
+			rf.me, globalIndex, sliceIndex,
 			argsEntry.Term, argsEntry.Command, len(rf.log))
 	}
 	// Persist once after all entries are added
 	rf.persist()
 
 	// [5] If leaderCommit > commitIndex, set commitIndex =
-	// min(leaderCommit, index of last new entry)
+	// min(leaderCommit, index of last entry in log)
 	if leadersCommit > rf.commitIndex {
-		rf.commitIndex = min(leadersCommit, indexRange)
+		lastLogIndex := rf.snapshotIndex + len(rf.log) - 1
+		rf.commitIndex = min(leadersCommit, lastLogIndex)
 	}
 
 	// If commitIndex > lastApplied: increment lastApplied, apply
 	// log[lastApplied] to state machine
 	for rf.commitIndex > rf.lastApplied {
-		rf.lastApplied++
-		if rf.lastApplied >= 0 && rf.lastApplied < len(rf.log) {
-			entry := rf.log[rf.lastApplied]
+		// Convert global index to slice index
+		sliceIndex := (rf.lastApplied + 1) - rf.snapshotIndex
+		if sliceIndex >= 0 && sliceIndex < len(rf.log) {
+			entry := rf.log[sliceIndex]
 			msg := ApplyMsg{true, entry.Command,
-				rf.lastApplied, false, nil, 0, 0}
+				rf.lastApplied + 1, false, nil, 0, 0}
 			rf.applyCh <- msg
 			Debug(dCommit, "S%d Follower, Committing new entry on term%d, commitIndex:%d, lastApplied:%d!"+
-				" Index: %d Term=%d Cmd=%d prevLogIndex=%d prevLogTerm=%d ",
-				rf.me, args.Term, rf.commitIndex, rf.lastApplied,
-				rf.lastApplied, entry.Term,
+				" GlobalIndex: %d SliceIndex: %d Term=%d Cmd=%d prevLogIndex=%d prevLogTerm=%d ",
+				rf.me, args.Term, rf.commitIndex, rf.lastApplied+1,
+				rf.lastApplied+1, sliceIndex, entry.Term,
 				entry.Command, prevLogIndex, prevLogTerm)
+			rf.lastApplied++
 			rf.persist()
+		} else {
+			// Entry not in log, skip it
+			rf.lastApplied++
 		}
 	}
 
@@ -756,7 +804,8 @@ func (rf *Raft) startLeaderHeartbeat() {
 		if i == rf.me { // Skip self
 			continue
 		}
-		rf.nextIndex[i] = len(rf.log)
+		// nextIndex should be a global index
+		rf.nextIndex[i] = rf.snapshotIndex + len(rf.log)
 		rf.matchindex[i] = 0
 	}
 
@@ -834,7 +883,7 @@ func (rf *Raft) electionTicker() {
 				lastLoggedTerm = rf.log[len(rf.log)-1].Term
 			}
 			args := RequestVoteArgs{candidateId, rf.currentTerm,
-				lastLoggedTerm, len(rf.log)}
+				lastLoggedTerm, rf.snapshotIndex + len(rf.log)}
 
 			// Send requestVote RPC to all known rafts in parallel
 			vote_results := make(chan bool, len(rf.peers)-1)
@@ -943,8 +992,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make(map[int]int)
 
-	// Initialize snapshot functionality (disabled by default)
-	rf.snapshotEnabled = false
+	// Initialize snapshot functionality
+	rf.snapshotEnabled = true
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
