@@ -166,22 +166,33 @@ func (rf *Raft) readSnapshot(snapshot []byte) {
 // The tester calls Snapshot() periodically
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	Debug(dSnap, "S%d Snapshot: attempting to acquire lock", rf.me)
-	rf.mu.Lock()
+
+	// Use TryLock to avoid blocking if another operation is in progress
+	if !rf.mu.TryLock() {
+		Debug(dSnap, "S%d Snapshot: could not acquire lock, deferring snapshot", rf.me)
+		// Defer the snapshot operation to avoid blocking
+		go func() {
+			time.Sleep(10 * time.Millisecond) // Brief delay
+			rf.Snapshot(index, snapshot)      // Retry
+		}()
+		return
+	}
+
 	Debug(dSnap, "S%d Snapshot: acquired lock", rf.me)
-	defer func() {
-		Debug(dSnap, "S%d Snapshot: releasing lock", rf.me)
-		rf.mu.Unlock()
-	}()
 
 	// Check if snapshots are enabled
 	if !rf.snapshotEnabled {
 		Debug(dSnap, "S%d Snapshot disabled, ignoring snapshot request at index %d", rf.me, index)
+		Debug(dSnap, "S%d Snapshot: releasing lock", rf.me)
+		rf.mu.Unlock()
 		return
 	}
 
 	// Ignore if index not ahead of current snapshot
 	if index <= rf.snapshotIndex {
 		Debug(dSnap, "S%d Snapshot ignored, index %d <= current snapshot index %d", rf.me, index, rf.snapshotIndex)
+		Debug(dSnap, "S%d Snapshot: releasing lock", rf.me)
+		rf.mu.Unlock()
 		return
 	}
 
@@ -189,6 +200,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	lastGlobalIndex := rf.snapshotIndex + len(rf.log) - 1
 	if index > lastGlobalIndex {
 		Debug(dSnap, "S%d Snapshot ignored, index %d > last log index %d", rf.me, index, lastGlobalIndex)
+		Debug(dSnap, "S%d Snapshot: releasing lock", rf.me)
+		rf.mu.Unlock()
 		return
 	}
 
@@ -196,6 +209,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index > rf.commitIndex {
 		Debug(dSnap, "S%d delaying snapshot at index %d until it's committed (current commitIndex: %d)",
 			rf.me, index, rf.commitIndex)
+		Debug(dSnap, "S%d Snapshot: releasing lock", rf.me)
+		rf.mu.Unlock()
 		return
 	}
 
@@ -220,9 +235,34 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.lastApplied = index
 	}
 
-	rf.persist()
+	// Prepare persistence data while holding lock
+	currentTerm := rf.currentTerm
+	votedFor := rf.votedFor
+	log := make([]LogEntry, len(rf.log))
+	copy(log, rf.log)
+	snapshotData := make([]byte, len(rf.snapshot))
+	copy(snapshotData, rf.snapshot)
 
 	Debug(dSnap, "S%d Snapshot taken at index %d, log size now %d", rf.me, index, len(rf.log))
+
+	// Release lock before expensive I/O operations
+	rf.mu.Unlock()
+
+	// Do expensive persistence operations without holding the lock
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(currentTerm)
+	e.Encode(votedFor)
+	e.Encode(log)
+	raftstate := w.Bytes()
+
+	rf.persister.Save(raftstate, snapshotData)
+	size := rf.persister.RaftStateSize()
+
+	Debug(dPersist, "S%d persist(), size=%d currentTerm%d loglength=%d votedFor=%d",
+		rf.me, size, currentTerm, len(log), votedFor)
+
+	// Function completed - final unlock not needed since we released it above
 }
 
 // EnableSnapshot enables or disables the snapshot functionality
@@ -309,6 +349,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Calculate the actual last log index
 	if len(rf.log) > 0 {
 		lastLoggedTerm = rf.log[len(rf.log)-1].Term
+	} else if rf.snapshotIndex > 0 {
+		// If log is empty but we have a snapshot, use snapshot term
+		lastLoggedTerm = rf.snapshotTerm
 	}
 	votedFor := rf.votedFor
 	logLength := rf.snapshotIndex + len(rf.log) // Convert to global index
@@ -332,8 +375,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// DEBUG: Log the vote request details
 	Debug(dVote, "S%d Follower, RequestVote received: candidate=%d, candidateTerm=%d, candidateLastLogTerm=%d, candidateLogLength=%d",
 		rf.me, args.CandidateId, args.CandidateTerm, args.CandidateLastLoggedTerm, args.CandidateLogLength)
-	Debug(dVote, "S%d Follower, current state: term=%d, votedFor=%d, lastLogTerm=%d, logLength=%d",
-		rf.me, currentTerm, votedFor, lastLoggedTerm, logLength)
+	Debug(dVote, "S%d Follower, current state: term=%d, votedFor=%d, lastLogTerm=%d, logLength=%d, snapshotIndex=%d, snapshotTerm=%d",
+		rf.me, currentTerm, votedFor, lastLoggedTerm, logLength, rf.snapshotIndex, rf.snapshotTerm)
 
 	// Case[1]: candidate has a lower term
 	if candidateTerm < currentTerm {
@@ -423,9 +466,14 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 	prevLogIndex := rf.nextIndex[server] - 1
 	prevLogTerm := 0
 
-	// If prevLogIndex is before our snapshot, we can't reference it
-	// This will cause the follower to reject the RPC and provide fast backup info
-	if prevLogIndex < rf.snapshotIndex {
+	// If nextIndex is at the snapshot boundary, we should start from there
+	// This prevents the infinite loop where we try to send entries before the snapshot
+	if rf.nextIndex[server] == rf.snapshotIndex {
+		prevLogIndex = rf.snapshotIndex
+		prevLogTerm = rf.snapshotTerm
+	} else if prevLogIndex < rf.snapshotIndex {
+		// If prevLogIndex is before our snapshot, we can't reference it
+		// This will cause the follower to reject the RPC and provide fast backup info
 		Debug(dLog, "S%d Leader, prevLogIndex=%d < snapshotIndex=%d, will be rejected by follower",
 			rf.me, prevLogIndex, rf.snapshotIndex)
 		// Use snapshotTerm when prevLogIndex is before our snapshot
@@ -467,11 +515,11 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 		// If nextIndex is beyond our log, we can't send any entries
 		// The follower will need to catch up through normal Raft mechanisms
 	} else {
-		// This should not happen if servers are synchronized
-		Debug(dLog, "S%d ERROR: startSliceIndex=%d < 0 for server %d (nextIndex=%d, snapshotIndex=%d)",
-			rf.me, startSliceIndex, server, rf.nextIndex[server], rf.snapshotIndex)
+		// startSliceIndex < 0 means follower is behind our snapshot
+		Debug(dLog, "S%d Leader, follower %d is behind snapshot (nextIndex=%d, snapshotIndex=%d), sending InstallSnapshot",
+			rf.me, server, rf.nextIndex[server], rf.snapshotIndex)
 		rf.mu.Unlock()
-		return false
+		return rf.sendInstallSnapshotToServer(server)
 	}
 
 	// If we have no entries to send and this is not a heartbeat, return
@@ -611,6 +659,8 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 
 // tryCommitEntries attempts to commit new entries based on matchIndex
 func (rf *Raft) tryCommitEntries() {
+	// This function is called from heartbeat loop, so we already hold the lock
+	// Don't try to acquire it again to avoid deadlock
 	// Calculate the actual last log index (global index)
 	actualLastLogIndex := rf.snapshotIndex + len(rf.log) - 1
 
@@ -647,10 +697,7 @@ func (rf *Raft) tryCommitEntries() {
 			select {
 			case rf.applyCh <- msg:
 				rf.lastApplied++
-				Debug(dCommit, "S%d Leader, Committing Entry! GlobalIndex:%d SliceIndex:%d Term=%d Cmd=%d",
-					rf.me, rf.lastApplied, sliceIndex, entry.Term, entry.Command)
 			default:
-				Debug(dCommit, "S%d Leader: applyCh full, skipping commit for entry at index %d", rf.me, rf.lastApplied+1)
 				// Don't increment lastApplied if we can't send to channel
 				break
 			}
@@ -659,8 +706,6 @@ func (rf *Raft) tryCommitEntries() {
 			rf.lastApplied++
 		} else {
 			// Entry should be in log but isn't - this is an error
-			Debug(dCommit, "S%d Leader, ERROR: Entry %d not found in log (sliceIndex=%d, logSize=%d)",
-				rf.me, rf.lastApplied+1, sliceIndex, len(rf.log))
 			// Skip this entry to avoid infinite loop
 			rf.lastApplied++
 		}
@@ -699,43 +744,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	logIndex := rf.snapshotIndex + len(rf.log) - 1
 	rf.persist()
 
-	// Trigger immediate replication to all followers
-	go func() {
-		// Track commit status
-		commitCount := 1 // Count self
-		commitChan := make(chan bool, len(rf.peers)-1)
-
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(peerIndex int) {
-				if !rf.killed() {
-					success := rf.sendAppendEntriesToPeer(peerIndex, false)
-					commitChan <- success
-				} else {
-					commitChan <- false
-				}
-			}(i)
-		}
-
-		// Wait for responses and track commits
-		for i := 0; i < len(rf.peers)-1; i++ {
-			select {
-			case success := <-commitChan:
-				if success {
-					commitCount++
-					if commitCount > len(rf.peers)/2 {
-						// Majority achieved, entry should be committed
-						break
-					}
-				}
-			case <-time.After(100 * time.Millisecond):
-				// Timeout to prevent hanging
-				break
-			}
-		}
-	}()
+	// Let the leader heartbeat mechanism handle replication
+	// Don't spawn additional goroutines here to prevent mutex contention
 
 	return logIndex, term, isLeader
 }
@@ -806,14 +816,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	Debug(dLog, "S%d Follower, current state: term=%d, state=%d, snapshotIndex=%d, logLen=%d, commitIndex=%d, lastApplied=%d",
 		rf.me, rf.currentTerm, rf.currentState, rf.snapshotIndex, len(rf.log), rf.commitIndex, rf.lastApplied)
 
-	// If prevLogIndex is inside our snapshot, tell leader to start from after our snapshot
+	// If prevLogIndex is before our snapshot, we assume we have all entries up to the snapshot
+	// and we'll process any entries that come after the snapshot boundary
 	if prevLogIndex < rf.snapshotIndex {
-		Debug(dDrop, "S%d Follower, prevLogIndex=%d is inside our snapshot (snapshotIndex=%d), telling leader to start from snapshot boundary",
-			rf.me, prevLogIndex, rf.snapshotIndex)
-		reply.Success = false
-		reply.XTerm = -1
-		reply.XIndex = -1
-		reply.XLen = rf.snapshotIndex // Tell leader to start from our snapshot boundary
+		// We have everything up to snapshotIndex, so we can accept entries from snapshotIndex onward
+		// Filter entries to only include those after our snapshot
+		var entriesToAdd []LogEntry
+		for i, entry := range args.Entries {
+			entryGlobalIndex := prevLogIndex + 1 + i // Global index of this entry
+			if entryGlobalIndex >= rf.snapshotIndex {
+				entriesToAdd = append(entriesToAdd, entry)
+			}
+		}
+
+		// If we have entries to add, add them to our log
+		if len(entriesToAdd) > 0 {
+			// Find the starting position in our log slice
+			firstEntryGlobalIndex := prevLogIndex + 1 + (len(args.Entries) - len(entriesToAdd))
+			startSliceIndex := firstEntryGlobalIndex - rf.snapshotIndex
+
+			// Ensure our log is large enough and append the entries
+			for len(rf.log) < startSliceIndex+len(entriesToAdd) {
+				rf.log = append(rf.log, LogEntry{})
+			}
+
+			// Copy the entries into our log
+			for i, entry := range entriesToAdd {
+				rf.log[startSliceIndex+i] = entry
+			}
+		}
+
+		// Update commit index
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, rf.snapshotIndex+len(rf.log)-1)
+		}
+
+		reply.Success = true
 		return
 	}
 
@@ -826,7 +864,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.me, prevLogSliceIndex, rf.log[prevLogSliceIndex].Term, rf.log[prevLogSliceIndex].Command)
 	}
 
-	if prevLogSliceIndex >= len(rf.log) ||
+	// Special case: if prevLogIndex == snapshotIndex, this is valid (snapshot boundary)
+	// We don't need to check the log entry since it's in the snapshot
+	if prevLogIndex == rf.snapshotIndex {
+		// Valid - the entry at snapshotIndex is valid (it's the snapshot boundary)
+		// Continue to process the entries normally
+	} else if prevLogSliceIndex >= len(rf.log) ||
 		(prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) && rf.log[prevLogSliceIndex].Term != prevLogTerm) {
 		term := 0
 		if prevLogSliceIndex >= 0 && prevLogSliceIndex < len(rf.log) {
@@ -1044,6 +1087,61 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
+// Helper function to send InstallSnapshot RPC when follower is behind snapshot
+func (rf *Raft) sendInstallSnapshotToServer(server int) bool {
+	// Need to acquire lock to read snapshot data
+	rf.mu.Lock()
+	if rf.currentState != Leader {
+		rf.mu.Unlock()
+		return false
+	}
+
+	args := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          int(rf.leaderId),
+		LastIncludedIndex: rf.snapshotIndex,
+		LastIncludedTerm:  rf.snapshotTerm,
+		Data:              make([]byte, len(rf.snapshot)),
+	}
+	copy(args.Data, rf.snapshot)
+	rf.mu.Unlock()
+
+	reply := InstallSnapshotReply{}
+	Debug(dSnap, "S%d Leader, sending InstallSnapshot to S%d: lastIncludedIndex=%d, lastIncludedTerm=%d",
+		rf.me, server, args.LastIncludedIndex, args.LastIncludedTerm)
+
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+	if !ok {
+		Debug(dSnap, "S%d Leader, InstallSnapshot RPC to S%d failed", rf.me, server)
+		return false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Process the reply
+	if reply.Term > rf.currentTerm {
+		// Follower has higher term, convert to follower
+		Debug(dSnap, "S%d Leader, InstallSnapshot reply from S%d has higher term %d > %d, converting to follower",
+			rf.me, server, reply.Term, rf.currentTerm)
+		rf.currentTerm = reply.Term
+		rf.votedFor = 0
+		rf.currentState = Follower
+		rf.persist()
+		return false
+	}
+
+	if reply.Term == rf.currentTerm && rf.currentState == Leader {
+		// Success - update follower's nextIndex and matchIndex
+		Debug(dSnap, "S%d Leader, InstallSnapshot to S%d successful, updating indices", rf.me, server)
+		rf.nextIndex[server] = args.LastIncludedIndex + 1
+		rf.matchindex[server] = args.LastIncludedIndex
+		return true
+	}
+
+	return false
+}
+
 // startLeaderHeartbeat starts the heartbeat process for a leader Raft instance.
 // Sends a heartbeat (AppendEntries) RPC to all peers at a regular interval.
 func (rf *Raft) startLeaderHeartbeat() {
@@ -1067,17 +1165,33 @@ func (rf *Raft) startLeaderHeartbeat() {
 
 	for !rf.killed() && rf.isLeader() {
 		Debug(dLeader, "S%d Leader, sending heartbeats", rf.me)
-		// Send heartbeats to all peers in parallel to avoid blocking
+		// Send heartbeats to all peers serially to reduce mutex contention
 		for i := range rf.peers {
 			if i == rf.me { // Skip self
 				continue
+			}
+			if rf.killed() || !rf.isLeader() {
+				break // Exit early if no longer leader
 			}
 			Debug(dLeader, "S%d Leader, sending heartbeat to S%d", rf.me, i)
 			go rf.sendAppendEntriesToPeer(i, true)
 		}
 
 		// Try to commit entries after sending heartbeats
-		rf.tryCommitEntries()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					Debug(dError, "S%d Leader, recovered from panic in tryCommitEntries: %v", rf.me, r)
+				}
+			}()
+			if rf.isLeader() {
+				rf.mu.Lock()
+				if rf.currentState == Leader { // Double-check while holding lock
+					rf.tryCommitEntries()
+				}
+				rf.mu.Unlock()
+			}
+		}()
 
 		<-ticker.C // Wait for next heartbeat interval
 	}
@@ -1093,11 +1207,8 @@ func (rf *Raft) electionTicker() {
 		var majorityVote = false
 
 		// Election Timeout - pause for a random amount of time.
-		var wg sync.WaitGroup
-		wg.Add(1)
 		var election_timeout = make(chan bool, 1)
 		go func() {
-			defer wg.Done()
 			ms := electionTimeout + (rand.Int63() % 250)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 			election_timeout <- true
@@ -1107,9 +1218,12 @@ func (rf *Raft) electionTicker() {
 		// RPC with higher term
 		_, isLeader := rf.GetState()
 		if isLeader {
-			wg.Wait()
+			<-election_timeout
 			continue
 		}
+
+		// Wait for election timeout before checking if we should start an election
+		<-election_timeout
 
 		Debug(dVote, "S%d electionTicker: attempting to acquire lock", rf.me)
 		rf.mu.Lock()
@@ -1141,6 +1255,9 @@ func (rf *Raft) electionTicker() {
 			// Calculate the actual last log index
 			if len(rf.log) > 0 {
 				lastLoggedTerm = rf.log[len(rf.log)-1].Term
+			} else if rf.snapshotIndex > 0 {
+				// If log is empty but we have a snapshot, use snapshot term
+				lastLoggedTerm = rf.snapshotTerm
 			}
 			args := RequestVoteArgs{candidateId, rf.currentTerm,
 				lastLoggedTerm, rf.snapshotIndex + len(rf.log)}
@@ -1164,21 +1281,14 @@ func (rf *Raft) electionTicker() {
 			rf.mu.Unlock()
 
 			// Wait for votes
-		loop:
 			for i := 0; i < len(rf.peers)-1; i++ {
-				select {
-				case vote := <-vote_results:
-					if vote {
-						Debug(dInfo, "S%d Candidate, got a vote.", rf.me)
-						votes++
-					}
-
-				case <-election_timeout:
-					Debug(dInfo, "S%d Candidate, timeout.", rf.me)
-					break loop
+				vote := <-vote_results
+				if vote {
+					Debug(dInfo, "S%d Candidate, got a vote.", rf.me)
+					votes++
 				}
 
-				// Go ahead and break out if we have a quorom
+				// Go ahead and break out if we have a quorum
 				if votes > (len(rf.peers) / 2) {
 					break
 				}
@@ -1222,8 +1332,6 @@ func (rf *Raft) electionTicker() {
 			}
 		}
 		rf.mu.Unlock()
-
-		wg.Wait()
 	}
 }
 
