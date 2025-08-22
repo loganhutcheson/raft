@@ -167,18 +167,7 @@ func (rf *Raft) readSnapshot(snapshot []byte) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	Debug(dSnap, "S%d Snapshot: attempting to acquire lock", rf.me)
 
-	// Use TryLock to avoid blocking if another operation is in progress
-	if !rf.mu.TryLock() {
-		Debug(dSnap, "S%d Snapshot: could not acquire lock, deferring snapshot", rf.me)
-		// Defer the snapshot operation to avoid blocking
-		go func() {
-			time.Sleep(10 * time.Millisecond) // Brief delay
-			rf.Snapshot(index, snapshot)      // Retry
-		}()
-		return
-	}
-
-	Debug(dSnap, "S%d Snapshot: acquired lock", rf.me)
+	rf.mu.Lock()
 
 	// Check if snapshots are enabled
 	if !rf.snapshotEnabled {
@@ -214,18 +203,74 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
-	// Convert global index to slice index
+	// Convert global index to slice index and validate
 	sliceIndex := index - rf.snapshotIndex
+	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
+		Debug(dSnap, "S%d Snapshot aborted, invalid slice index %d", rf.me, sliceIndex)
+		rf.mu.Unlock()
+		return
+	}
 
-	// Get term at snapshot index
-	rf.snapshotTerm = rf.log[sliceIndex].Term
+	// Get term at snapshot index and create a snapshot of current state
+	snapshotTerm := rf.log[sliceIndex].Term
+	if snapshotTerm == 0 {
+		Debug(dSnap, "S%d Snapshot aborted, entry at index %d has term 0", rf.me, index)
+		rf.mu.Unlock()
+		return
+	}
 
-	// Truncate log from slice index onwards
+	// Store values needed for persistence while holding lock
+	currentTerm := rf.currentTerm
+	votedFor := rf.votedFor
+	newLog := rf.log[sliceIndex+1:] // New log after truncation
+
+	// Release lock before expensive persistence operation
+	rf.mu.Unlock()
+
+	// Do expensive I/O operations without holding lock
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(currentTerm)
+	e.Encode(votedFor)
+	e.Encode(newLog)
+	raftstate := w.Bytes()
+
+	// Copy snapshot data
+	snapshotData := make([]byte, len(snapshot))
+	copy(snapshotData, snapshot)
+
+	// Re-acquire lock to apply changes atomically
+	rf.mu.Lock()
+
+	// CRITICAL: Validate that log state hasn't changed invalidly during I/O
+	// Check that we can still apply this snapshot
+	if index <= rf.snapshotIndex {
+		Debug(dSnap, "S%d Snapshot cancelled, already have newer snapshot %d >= %d",
+			rf.me, rf.snapshotIndex, index)
+		rf.mu.Unlock()
+		return
+	}
+
+	// Re-validate the slice index
+	sliceIndex = index - rf.snapshotIndex
+	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
+		Debug(dSnap, "S%d Snapshot cancelled, log structure changed during I/O", rf.me)
+		rf.mu.Unlock()
+		return
+	}
+
+	// Re-validate that the entry at the snapshot index hasn't changed
+	if rf.log[sliceIndex].Term != snapshotTerm {
+		Debug(dSnap, "S%d Snapshot cancelled, log entry term changed during I/O", rf.me)
+		rf.mu.Unlock()
+		return
+	}
+
+	// Apply the snapshot atomically
 	rf.log = rf.log[sliceIndex+1:]
-
-	// Store snapshot data
-	rf.snapshot = snapshot
+	rf.snapshot = snapshotData
 	rf.snapshotIndex = index
+	rf.snapshotTerm = snapshotTerm
 
 	// Ensure commitIndex and lastApplied are at least the snapshot index
 	if rf.commitIndex < index {
@@ -235,34 +280,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.lastApplied = index
 	}
 
-	// Prepare persistence data while holding lock
-	currentTerm := rf.currentTerm
-	votedFor := rf.votedFor
-	log := make([]LogEntry, len(rf.log))
-	copy(log, rf.log)
-	snapshotData := make([]byte, len(rf.snapshot))
-	copy(snapshotData, rf.snapshot)
+	Debug(dSnap, "S%d Snapshot applied at index %d, term %d, log size now %d",
+		rf.me, index, snapshotTerm, len(rf.log))
 
-	Debug(dSnap, "S%d Snapshot taken at index %d, log size now %d", rf.me, index, len(rf.log))
-
-	// Release lock before expensive I/O operations
-	rf.mu.Unlock()
-
-	// Do expensive persistence operations without holding the lock
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(currentTerm)
-	e.Encode(votedFor)
-	e.Encode(log)
-	raftstate := w.Bytes()
-
+	// Save the pre-computed persistence data
 	rf.persister.Save(raftstate, snapshotData)
 	size := rf.persister.RaftStateSize()
+	Debug(dPersist, "S%d persist() after snapshot, size=%d currentTerm%d loglength=%d votedFor=%d",
+		rf.me, size, currentTerm, len(newLog), votedFor)
 
-	Debug(dPersist, "S%d persist(), size=%d currentTerm%d loglength=%d votedFor=%d",
-		rf.me, size, currentTerm, len(log), votedFor)
-
-	// Function completed - final unlock not needed since we released it above
+	rf.mu.Unlock()
 }
 
 // EnableSnapshot enables or disables the snapshot functionality
@@ -518,6 +545,12 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 		// startSliceIndex < 0 means follower is behind our snapshot
 		Debug(dLog, "S%d Leader, follower %d is behind snapshot (nextIndex=%d, snapshotIndex=%d), sending InstallSnapshot",
 			rf.me, server, rf.nextIndex[server], rf.snapshotIndex)
+
+		// CRITICAL: Mark that we're sending InstallSnapshot by updating nextIndex immediately
+		// This prevents concurrent AppendEntries from interfering
+		rf.nextIndex[server] = rf.snapshotIndex + 1
+		rf.matchindex[server] = 0 // Reset match index since we're resending everything
+
 		rf.mu.Unlock()
 		return rf.sendInstallSnapshotToServer(server)
 	}
@@ -560,6 +593,14 @@ func (rf *Raft) sendAppendEntriesToPeer(server int, isHeartbeat bool) bool {
 
 	// Check if we're still leader and term hasn't changed
 	if rf.currentState != Leader || rf.currentTerm != args.Term {
+		return false
+	}
+
+	// CRITICAL: Check if follower's nextIndex has been updated by InstallSnapshot
+	// This prevents stale AppendEntries from corrupting the log after a snapshot
+	if rf.nextIndex[server] > args.PrevLogIndex+len(args.Entries)+1 {
+		Debug(dLog, "S%d Leader, AppendEntries STALE for server %d: nextIndex=%d > expectedNext=%d, ignoring response",
+			rf.me, server, rf.nextIndex[server], args.PrevLogIndex+len(args.Entries)+1)
 		return false
 	}
 
@@ -693,14 +734,11 @@ func (rf *Raft) tryCommitEntries() {
 				Command:      entry.Command,
 				CommandIndex: rf.lastApplied + 1,
 			}
-			// Use non-blocking send to avoid deadlock
-			select {
-			case rf.applyCh <- msg:
-				rf.lastApplied++
-			default:
-				// Don't increment lastApplied if we can't send to channel
-				break
-			}
+			// Release mutex before blocking send to avoid deadlock
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			rf.lastApplied++
 		} else if (rf.lastApplied + 1) <= rf.snapshotIndex {
 			// Entry is already in snapshot, no need to apply it again
 			rf.lastApplied++
@@ -816,44 +854,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	Debug(dLog, "S%d Follower, current state: term=%d, state=%d, snapshotIndex=%d, logLen=%d, commitIndex=%d, lastApplied=%d",
 		rf.me, rf.currentTerm, rf.currentState, rf.snapshotIndex, len(rf.log), rf.commitIndex, rf.lastApplied)
 
-	// If prevLogIndex is before our snapshot, we assume we have all entries up to the snapshot
-	// and we'll process any entries that come after the snapshot boundary
+	// CRITICAL: Reject stale AppendEntries that try to append entries before our snapshot
+	// This prevents race conditions where old AppendEntries arrive after InstallSnapshot
+	if len(args.Entries) > 0 {
+		lastEntryIndex := prevLogIndex + len(args.Entries)
+		if lastEntryIndex <= rf.snapshotIndex {
+			Debug(dLog, "S%d Follower, REJECTING stale AppendEntries: lastEntryIndex=%d <= snapshotIndex=%d",
+				rf.me, lastEntryIndex, rf.snapshotIndex)
+			reply.Success = false
+			reply.XLen = rf.snapshotIndex + len(rf.log)
+			return
+		}
+	}
+
+	// CRITICAL: Reject AppendEntries where prevLogIndex is within our snapshot
+	// After InstallSnapshot, we should only accept AppendEntries with prevLogIndex >= snapshotIndex
 	if prevLogIndex < rf.snapshotIndex {
-		// We have everything up to snapshotIndex, so we can accept entries from snapshotIndex onward
-		// Filter entries to only include those after our snapshot
-		var entriesToAdd []LogEntry
-		for i, entry := range args.Entries {
-			entryGlobalIndex := prevLogIndex + 1 + i // Global index of this entry
-			if entryGlobalIndex >= rf.snapshotIndex {
-				entriesToAdd = append(entriesToAdd, entry)
-			}
-		}
-
-		// If we have entries to add, add them to our log
-		if len(entriesToAdd) > 0 {
-			// Find the starting position in our log slice
-			firstEntryGlobalIndex := prevLogIndex + 1 + (len(args.Entries) - len(entriesToAdd))
-			startSliceIndex := firstEntryGlobalIndex - rf.snapshotIndex
-
-			// Ensure our log is large enough and append the entries
-			for len(rf.log) < startSliceIndex+len(entriesToAdd) {
-				rf.log = append(rf.log, LogEntry{})
-			}
-
-			// Copy the entries into our log
-			for i, entry := range entriesToAdd {
-				rf.log[startSliceIndex+i] = entry
-			}
-		}
-
-		// Update commit index
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, rf.snapshotIndex+len(rf.log)-1)
-		}
-
-		reply.Success = true
+		Debug(dLog, "S%d Follower, REJECTING AppendEntries with prevLogIndex in snapshot: prevLogIndex=%d < snapshotIndex=%d",
+			rf.me, prevLogIndex, rf.snapshotIndex)
+		reply.Success = false
+		reply.XLen = rf.snapshotIndex + len(rf.log)
 		return
 	}
+
+	// Note: prevLogIndex < rf.snapshotIndex case is now handled by rejection above
 
 	// DEBUG: Log the log consistency check details
 	Debug(dLog, "S%d Follower, checking log consistency: prevLogSliceIndex=%d, logLen=%d, expectedTerm=%d",
@@ -973,23 +997,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Command:      entry.Command,
 				CommandIndex: rf.lastApplied + 1,
 			}
-			// Use non-blocking send to avoid deadlock
-			select {
-			case rf.applyCh <- msg:
-				rf.lastApplied++
-				Debug(dCommit, "S%d Follower, Committing new entry on term%d, commitIndex:%d, lastApplied:%d!"+
-					" GlobalIndex: %d SliceIndex: %d Term=%d Cmd=%d prevLogIndex=%d prevLogTerm=%d ",
-					rf.me, args.Term, rf.commitIndex, rf.lastApplied,
-					rf.lastApplied, sliceIndex, entry.Term,
-					entry.Command, prevLogIndex, prevLogTerm)
-				rf.persist()
-			default:
-				Debug(dCommit, "S%d Follower, applyCh full, skipping commit for entry at index %d", rf.me, rf.lastApplied+1)
-				// Don't increment lastApplied if we can't send to channel
-				break
-			}
+			// Release mutex before blocking send to avoid deadlock
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			rf.lastApplied++
+			Debug(dCommit, "S%d Follower, Committing new entry on term%d, commitIndex:%d, lastApplied:%d!"+
+				" GlobalIndex: %d SliceIndex: %d Term=%d Cmd=%d prevLogIndex=%d prevLogTerm=%d ",
+				rf.me, args.Term, rf.commitIndex, rf.lastApplied,
+				rf.lastApplied, sliceIndex, entry.Term,
+				entry.Command, prevLogIndex, prevLogTerm)
+			rf.persist()
+		} else if (rf.lastApplied + 1) <= rf.snapshotIndex {
+			// Entry is already in snapshot, no need to apply it again
+			rf.lastApplied++
 		} else {
-			// Entry not in log, skip it
+			// Entry should be in log but isn't - this is an error
+			// Skip this entry to avoid infinite loop
 			rf.lastApplied++
 		}
 	}
@@ -1054,6 +1078,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshotIndex = args.LastIncludedIndex
 	rf.snapshotTerm = args.LastIncludedTerm
 	rf.snapshot = args.Data
+
+	// Update commitIndex and lastApplied to the snapshot index
+	// This is crucial for maintaining consistency after applying the snapshot
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex
+
 	rf.persist()
 
 	// Reset state machine using snapshot contents
@@ -1065,16 +1095,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.LastIncludedIndex,
 	}
 
-	// Use non-blocking send to avoid deadlock
-	select {
-	case rf.applyCh <- msg:
-		Debug(dLog, "S%d InstallSnapshot: applied snapshot at index %d", rf.me, args.LastIncludedIndex)
-		// Update lastApplied to the snapshot index
-		rf.lastApplied = args.LastIncludedIndex
-		rf.commitIndex = args.LastIncludedIndex
-	default:
-		Debug(dLog, "S%d InstallSnapshot: applyCh full, skipping snapshot application", rf.me)
-	}
+	// Release mutex before blocking send to avoid deadlock
+	rf.mu.Unlock()
+	rf.applyCh <- msg
+	rf.mu.Lock()
+	Debug(dLog, "S%d InstallSnapshot: applied snapshot at index %d", rf.me, args.LastIncludedIndex)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -1132,10 +1157,17 @@ func (rf *Raft) sendInstallSnapshotToServer(server int) bool {
 	}
 
 	if reply.Term == rf.currentTerm && rf.currentState == Leader {
-		// Success - update follower's nextIndex and matchIndex
-		Debug(dSnap, "S%d Leader, InstallSnapshot to S%d successful, updating indices", rf.me, server)
-		rf.nextIndex[server] = args.LastIncludedIndex + 1
-		rf.matchindex[server] = args.LastIncludedIndex
+		// Success - update follower's nextIndex and matchIndex only if not already advanced
+		// This prevents overwriting more recent updates from concurrent AppendEntries
+		if rf.nextIndex[server] <= args.LastIncludedIndex+1 {
+			Debug(dSnap, "S%d Leader, InstallSnapshot to S%d successful, updating indices: nextIndex=%d->%d, matchIndex=%d->%d",
+				rf.me, server, rf.nextIndex[server], args.LastIncludedIndex+1, rf.matchindex[server], args.LastIncludedIndex)
+			rf.nextIndex[server] = args.LastIncludedIndex + 1
+			rf.matchindex[server] = args.LastIncludedIndex
+		} else {
+			Debug(dSnap, "S%d Leader, InstallSnapshot to S%d successful but nextIndex already advanced: current=%d, snapshot+1=%d",
+				rf.me, server, rf.nextIndex[server], args.LastIncludedIndex+1)
+		}
 		return true
 	}
 

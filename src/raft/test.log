@@ -1,0 +1,9 @@
+000007 INFO S0, restarted
+000007 VOTE S0 electionTicker: starting iteration
+000013 INFO S1, restarted
+000013 VOTE S1 electionTicker: starting iteration
+000014 INFO S2, restarted
+Test (3D): snapshots basic ...
+000014 VOTE S2 electionTicker: starting iteration
+signal: interrupt
+FAIL	6.5840/raft	1.008s
